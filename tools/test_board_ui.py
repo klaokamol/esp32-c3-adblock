@@ -34,7 +34,7 @@ class BoardUi(unittest.TestCase):
         self.assertEqual(out[12:18], ["0m", "59m", "1h", "47h", "2d", "999d"])
         self.assertEqual(out[18], "1101010")
         self.assertEqual(out[19], "1011")
-        self.assertEqual(out[20:], ["4", "3", "3", "2", "2", "1", "1", "0", "0"])
+        self.assertEqual(out[20:], ["3", "3", "3", "2", "2", "1", "1", "0", "0"])
 
 
 if __name__ == "__main__":

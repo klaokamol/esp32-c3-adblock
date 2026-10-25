@@ -554,7 +554,7 @@ static void startConfigPortal() {
   const char* ap = "C3-AdBlock";
   WiFi.mode(WIFI_AP); WiFi.softAPConfig(IPAddress(192, 168, 2, 1), IPAddress(192, 168, 2, 1), IPAddress(255, 255, 255, 0)); WiFi.softAP(ap);
   IPAddress apIP = WiFi.softAPIP();
-  oledLines("SETUP WIFI", "Join:", ap, apIP.toString().c_str());
+  oledLines(ap, apIP.toString().c_str());
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
   web.on("/", handlePortalRoot);
   web.on("/wifisave", HTTP_POST, handleWifiSave);
@@ -646,7 +646,7 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
-  uiTick(totalBlocked, totalAllowed, numClients, !blockingOn);
+  uiTick(totalBlocked, totalAllowed, numClients, numHashes, !blockingOn);
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();

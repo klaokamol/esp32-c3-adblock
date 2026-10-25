@@ -17,7 +17,7 @@ static inline void fmtUptime(char* o, size_t n, uint32_t s) {
 }
 
 static inline int rssiBars(int rssi) {
-  return rssi > -55 ? 4 : rssi > -65 ? 3 : rssi > -75 ? 2 : rssi > -85 ? 1 : 0;
+  return rssi > -60 ? 3 : rssi > -75 ? 2 : rssi > -85 ? 1 : 0;
 }
 
 static inline bool ledOn(uint32_t t, bool paused, bool wifi) {
@@ -113,7 +113,7 @@ static void oledLines(const char* a, const char* b = "", const char* c = "", con
   oledFlush();
 }
 
-static void uiTick(uint32_t blocked, uint32_t allowed, int clients, bool paused) {
+static void uiTick(uint32_t blocked, uint32_t allowed, int clients, uint32_t domains, bool paused) {
   static bool prevLow = false, prevPaused = false;
   uint32_t now = millis();
   digitalWrite(LED_PIN, ledOn(now, paused, WiFi.status() == WL_CONNECTED) ? LOW : HIGH);
@@ -127,14 +127,21 @@ static void uiTick(uint32_t blocked, uint32_t allowed, int clients, bool paused)
   uiLast = now ? now : 1;
   char v[8], s[16];
   oledStart();
-  oledPut(0, 0, paused ? "PAUSED" : "ADBLOCK");
-  int bars = rssiBars(WiFi.RSSI());
-  for (int b = 0; b < bars; b++)
-    oled.drawFastVLine(PANEL_X + 64 + 2 * b, PANEL_Y + TOP + 6 - 2 * b, 2 * b + 1, SSD1306_WHITE);
+  oledPut(0, 0, paused ? "Paused" : "Adblock");
+  bool up = WiFi.status() == WL_CONNECTED;
+  int bars = up ? rssiBars(WiFi.RSSI()) : 0;
+  for (int b = 0; b < 3; b++) {
+    if (b < bars) oled.fillRect(PANEL_X + 63 + 3 * b, PANEL_Y + TOP + 5 - 2 * b, 2, 2 * b + 2, SSD1306_WHITE);
+    else if (up && !bars) oled.fillRect(PANEL_X + 63 + 3 * b, PANEL_Y + TOP + 6, 2, 1, SSD1306_WHITE);
+  }
+  if (!up) {
+    oled.drawLine(PANEL_X + 64, PANEL_Y + 2, PANEL_X + 69, PANEL_Y + 7, SSD1306_WHITE);
+    oled.drawLine(PANEL_X + 69, PANEL_Y + 2, PANEL_X + 64, PANEL_Y + 7, SSD1306_WHITE);
+  }
   fmtCount(v, sizeof v, blocked); snprintf(s, sizeof s, "B:%s", v); oledPut(0, 1, s);
   fmtCount(v, sizeof v, allowed); snprintf(s, sizeof s, "A:%s", v); oledPut(COL2, 1, s);
   snprintf(s, sizeof s, "C:%d", clients); oledPut(0, 2, s);
-  snprintf(s, sizeof s, "W:%d", WiFi.RSSI()); oledPut(COL2, 2, s);
+  fmtCount(v, sizeof v, domains); snprintf(s, sizeof s, "D:%s", v); oledPut(COL2, 2, s);
   snprintf(s, sizeof s, "T:%.0fC", temperatureRead()); oledPut(0, 3, s);
   fmtUptime(v, sizeof v, now / 1000); snprintf(s, sizeof s, "U:%s", v); oledPut(COL2, 3, s);
   oledFlush();
@@ -143,5 +150,5 @@ static void uiTick(uint32_t blocked, uint32_t allowed, int clients, bool paused)
 static inline void uiBegin() {}
 static inline void uiButton(int) {}
 static inline void oledLines(const char*, const char* = "", const char* = "", const char* = "") {}
-static inline void uiTick(uint32_t, uint32_t, int, bool) {}
+static inline void uiTick(uint32_t, uint32_t, int, uint32_t, bool) {}
 #endif
