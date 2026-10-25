@@ -316,7 +316,7 @@ static String htmlEscape(const String& s) {
 }
 
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
-#include "oled.h"
+#include "board_ui.h"
 
 static void handleStats() {
   uint32_t up = millis() / 1000;
@@ -569,7 +569,7 @@ static void startConfigPortal() {
 void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
-  oledBegin(); oledLines("C3 ADBLOCK", "booting...");
+  uiBegin(); oledLines("C3 ADBLOCK", "booting...");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) {
@@ -591,6 +591,7 @@ void setup() {
     if (digitalRead(BOOT_PIN) == LOW) { prefs.begin("wifi", false); prefs.clear(); prefs.end();
       Serial.println("[setup] BOOT held -> cleared saved WiFi"); } }
 
+  uiButton(BOOT_PIN);
   oledLines("C3 ADBLOCK", "WiFi...");
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
@@ -638,7 +639,7 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
-  oledTick(totalBlocked, totalAllowed, numHashes, !blockingOn);
+  uiTick(totalBlocked, totalAllowed, numClients, !blockingOn);
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
