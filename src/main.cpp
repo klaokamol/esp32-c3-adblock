@@ -316,6 +316,7 @@ static String htmlEscape(const String& s) {
 }
 
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
+#include "oled.h"
 
 static void handleStats() {
   uint32_t up = millis() / 1000;
@@ -543,10 +544,10 @@ static void startConfigPortal() {
   int n = WiFi.scanNetworks();                 // scan while still in STA mode (no APSTA)
   portalOpts = "";
   for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + htmlEscape(WiFi.SSID(i)) + "'>";
-  uint8_t mac[6]; WiFi.macAddress(mac);
-  char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
+  const char* ap = "C3-AdBlock";
   WiFi.mode(WIFI_AP); WiFi.softAP(ap);
   IPAddress apIP = WiFi.softAPIP();
+  oledLines("SETUP WIFI", "Join:", ap, apIP.toString().c_str());
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
   web.on("/", handlePortalRoot);
   web.on("/wifisave", HTTP_POST, handleWifiSave);
@@ -568,6 +569,7 @@ static void startConfigPortal() {
 void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
+  oledBegin(); oledLines("C3 ADBLOCK", "booting...");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) {
@@ -589,8 +591,10 @@ void setup() {
     if (digitalRead(BOOT_PIN) == LOW) { prefs.begin("wifi", false); prefs.clear(); prefs.end();
       Serial.println("[setup] BOOT held -> cleared saved WiFi"); } }
 
+  oledLines("C3 ADBLOCK", "WiFi...");
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
+  oledLines("WiFi up", WiFi.localIP().toString().c_str());
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
   if (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0)
@@ -634,6 +638,7 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
+  oledTick(totalBlocked, totalAllowed, numHashes, !blockingOn);
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
