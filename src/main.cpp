@@ -317,6 +317,8 @@ static String htmlEscape(const String& s) {
 
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
 #include "board_ui.h"
+#include "hashlist.h"
+static_assert(HASH_BYTES == 5, "hashlist.h assumes 5-byte hashes");
 
 static void handleStats() {
   uint32_t up = millis() / 1000;
@@ -371,17 +373,26 @@ static void reopenBlocklist() {
   numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
   buildFlashIndex();
 }
-static void beginBlocklistSwap() {
+static const size_t SWAP_SLACK = 16 * 4096;
+static void beginBlocklistSwap(int incoming) {
+  LittleFS.remove("/blocklist.new");
+  if (incoming > 0 && LittleFS.totalBytes() - LittleFS.usedBytes() >= (size_t)incoming + SWAP_SLACK) return;
   if (blocklist) blocklist.close();
   numHashes = 0;
   LittleFS.remove(BLOCKLIST_PATH);
-  LittleFS.remove("/blocklist.new");
+}
+static bool blobSorted(File& f) {
+  uint64_t prev = 0; int n;
+  while ((n = f.read(rangeBuf, sizeof(rangeBuf))) > 0) if (!hashesAscending(rangeBuf, n, &prev)) return false;
+  return true;
 }
 static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
   File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
+  size_t sz = f ? f.size() : 0;
   bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
+  ok = ok && blobSorted(f);
+  if (f) f.close();
+  if (ok) { if (blocklist) blocklist.close(); LittleFS.remove(BLOCKLIST_PATH); LittleFS.rename("/blocklist.new", BLOCKLIST_PATH); }
   else    LittleFS.remove("/blocklist.new");
   reopenBlocklist();
   return ok;
@@ -402,7 +413,7 @@ static void handleUpload() {
     case UPLOAD_FILE_START:
       upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
-      upOk = false; beginBlocklistSwap();
+      upOk = false; beginBlocklistSwap(web.clientContentLength());
       upFile = LittleFS.open("/blocklist.new", "w");
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
@@ -447,18 +458,19 @@ static bool fetchBlocklist(String url) {
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) { updateStatus = "HTTP " + String(code) + " " + HTTPClient::errorToString(code) + ", heap " + String(ESP.getFreeHeap() / 1024) + "K"; http.end(); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
-  beginBlocklistSwap();
+  int len = http.getSize();
+  beginBlocklistSwap(len);
   File f = LittleFS.open("/blocklist.new", "w");
   if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
   WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  uint8_t b[1024]; size_t total = 0; uint32_t idle = millis(); bool stalled = false;
   while (http.connected() && (len < 0 || (int)total < len)) {
     size_t avail = stream->available();
     if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
-    else { if (millis() - idle > 15000) break; delay(2); }
+    else { if (millis() - idle > 15000) { stalled = true; break; } delay(2); }
   }
   f.close(); http.end();
-  if (len > 0 && total != (size_t)len) {
+  if (stalled || (len > 0 && total != (size_t)len)) {
     LittleFS.remove("/blocklist.new"); reopenBlocklist();
     updateStatus = "truncated (" + String(total) + "/" + String(len) + "B)";
     Serial.printf("[remote] %s\n", updateStatus.c_str());
@@ -651,7 +663,7 @@ void loop() {
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
     if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
-    else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
+    else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; if (!fetchBlocklist(updateUrl) && numHashes == 0) lastCheckMs -= updateIntervalH * 3600000UL - 600000UL; }
   }
   if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
 }
