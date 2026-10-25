@@ -458,6 +458,12 @@ static bool fetchBlocklist(String url) {
     else { if (millis() - idle > 15000) break; delay(2); }
   }
   f.close(); http.end();
+  if (len > 0 && total != (size_t)len) {
+    LittleFS.remove("/blocklist.new"); reopenBlocklist();
+    updateStatus = "truncated (" + String(total) + "/" + String(len) + "B)";
+    Serial.printf("[remote] %s\n", updateStatus.c_str());
+    return false;
+  }
   bool ok = commitNewBlocklist();
   updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
   Serial.printf("[remote] %s\n", updateStatus.c_str());
