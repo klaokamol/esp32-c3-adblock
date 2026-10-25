@@ -552,7 +552,7 @@ static void startConfigPortal() {
   portalOpts = "";
   for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + htmlEscape(WiFi.SSID(i)) + "'>";
   const char* ap = "C3-AdBlock";
-  WiFi.mode(WIFI_AP); WiFi.softAP(ap);
+  WiFi.mode(WIFI_AP); WiFi.softAPConfig(IPAddress(192, 168, 2, 1), IPAddress(192, 168, 2, 1), IPAddress(255, 255, 255, 0)); WiFi.softAP(ap);
   IPAddress apIP = WiFi.softAPIP();
   oledLines("SETUP WIFI", "Join:", ap, apIP.toString().c_str());
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
