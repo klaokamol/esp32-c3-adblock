@@ -27,7 +27,11 @@
 #ifndef UPSTREAM_PORT
 #define UPSTREAM_PORT 53
 #endif
+#ifndef UPSTREAM2_IP
+#define UPSTREAM2_IP 149, 112, 112, 112
+#endif
 static const IPAddress UPSTREAM(UPSTREAM_IP);
+static const IPAddress UPSTREAM2(UPSTREAM2_IP);
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
@@ -244,6 +248,7 @@ static int buildBlocked(int qend, uint16_t qtype) {
 // to the next client (every answer shifted by one). Now: drain stale datagrams first,
 // send with a fresh random txid, and only accept a reply whose txid, question section,
 // and source address/port match. The client's own txid is restored on the way back.
+static uint8_t upPref = 0;
 static int forwardUpstream(int qlen, int qend) {
   upstreamCli.flush();                                   // release any half-read buffer
   while (upstreamCli.parsePacket() > 0) upstreamCli.flush();   // drop stale late replies
@@ -253,19 +258,28 @@ static int forwardUpstream(int qlen, int qend) {
   const bool haveQ = ql > 0 && ql <= (int)sizeof(q) && qend <= qlen;
   if (haveQ) memcpy(q, buf + 12, ql);
   buf[0] = wid >> 8; buf[1] = wid & 0xFF;
-  upstreamCli.beginPacket(UPSTREAM, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
-  const uint32_t t0 = millis();
-  while (millis() - t0 < 1000) {                         // deadline, not a retry count
-    int sz = upstreamCli.parsePacket();
-    if (sz <= 0) { delay(1); continue; }
-    const bool fromUp = upstreamCli.remoteIP() == UPSTREAM && upstreamCli.remotePort() == UPSTREAM_PORT;
-    int n = upstreamCli.read(buf, sizeof(buf));
-    upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
-    if (!fromUp || n < 12 || sz > (int)sizeof(buf)) continue;
-    if (buf[0] != (wid >> 8) || buf[1] != (wid & 0xFF)) continue;
-    if (haveQ && (n < 12 + ql || memcmp(buf + 12, q, ql) != 0)) continue;
-    buf[0] = cid0; buf[1] = cid1;
-    return n;
+  static uint8_t sent[512];
+  const int tries = qlen <= (int)sizeof(sent) ? 2 : 1;
+  if (tries == 2) memcpy(sent, buf, qlen);
+  for (int a = 0; a < tries; a++) {
+    const uint8_t s = upPref ^ a;
+    const IPAddress up = s ? UPSTREAM2 : UPSTREAM;
+    if (a) memcpy(buf, sent, qlen);
+    upstreamCli.beginPacket(up, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
+    const uint32_t t0 = millis();
+    while (millis() - t0 < 1000) {                         // deadline, not a retry count
+      int sz = upstreamCli.parsePacket();
+      if (sz <= 0) { delay(1); continue; }
+      const bool fromUp = upstreamCli.remoteIP() == up && upstreamCli.remotePort() == UPSTREAM_PORT;
+      int n = upstreamCli.read(buf, sizeof(buf));
+      upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
+      if (!fromUp || n < 12 || sz > (int)sizeof(buf)) continue;
+      if (buf[0] != (wid >> 8) || buf[1] != (wid & 0xFF)) continue;
+      if (haveQ && (n < 12 + ql || memcmp(buf + 12, q, ql) != 0)) continue;
+      buf[0] = cid0; buf[1] = cid1;
+      upPref = s;
+      return n;
+    }
   }
   return 0;
 }
