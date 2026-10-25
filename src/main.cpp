@@ -465,9 +465,10 @@ static bool fetchBlocklist(String url) {
   WiFiClient* stream = http.getStreamPtr();
   uint8_t b[1024]; size_t total = 0; uint32_t idle = millis(); bool stalled = false;
   while (http.connected() && (len < 0 || (int)total < len)) {
+    bool dns = handleDns();
     size_t avail = stream->available();
     if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
-    else { if (millis() - idle > 15000) { stalled = true; break; } delay(2); }
+    else { if (millis() - idle > 15000) { stalled = true; break; } if (!dns) delay(2); }
   }
   f.close(); http.end();
   if (stalled || (len > 0 && total != (size_t)len)) {
