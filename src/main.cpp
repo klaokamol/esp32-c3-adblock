@@ -300,6 +300,7 @@ static bool pollUpstream() {
 static bool handleDns() {
   bool did = false;
   for (int budget = 0; budget < 16 && pendFree(pending, PEND_SLOTS) >= 0; budget++) {
+    if (pollUpstream()) did = true;
     int sz = dnsServer.parsePacket(); if (sz <= 0) break;
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
