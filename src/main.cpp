@@ -267,7 +267,7 @@ static int forwardUpstream(int qlen, int qend) {
     if (a) memcpy(buf, sent, qlen);
     upstreamCli.beginPacket(up, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
     const uint32_t t0 = millis();
-    while (millis() - t0 < 1000) {                         // deadline, not a retry count
+    while (millis() - t0 < 500) {                       // deadline, not a retry count
       int sz = upstreamCli.parsePacket();
       if (sz <= 0) { delay(1); continue; }
       const bool fromUp = upstreamCli.remoteIP() == up && upstreamCli.remotePort() == UPSTREAM_PORT;
