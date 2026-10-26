@@ -20,7 +20,6 @@
 #include "esp_task.h"
 #include <freertos/message_buffer.h>
 #include "pending.h"
-#include "dnsttl.h"
 #include "esp_private/wifi.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
@@ -301,10 +300,6 @@ static void udpSend(int fd, uint32_t ip, uint16_t port, const uint8_t* d, int n)
   sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = ip;
   sendto(fd, d, n, 0, (sockaddr*)&a, sizeof a);
 }
-struct SeenName { uint64_t key; uint32_t until; };
-static const int SEEN_SLOTS = 256;
-static SeenName seen[SEEN_SLOTS];
-static uint32_t wouldHit = 0, keyedFwd = 0;
 static const uint32_t GAP_EDGES_MS[] = {50, 100, 300, 1000, 3000, 10000, 30000};
 static const int GAP_BUCKETS = sizeof(GAP_EDGES_MS) / sizeof(GAP_EDGES_MS[0]) + 1;
 static uint32_t gapHist[GAP_BUCKETS], lastQueryMs = 0;
@@ -316,19 +311,7 @@ static void countGap(uint32_t now) {
   }
   lastQueryMs = now ? now : 1;
 }
-static void noteForward(uint64_t key) {
-  if (!key) return;
-  keyedFwd++;
-  const SeenName& e = seen[(key >> 16) & (SEEN_SLOTS - 1)];
-  if (e.key == key && (int32_t)(e.until - millis()) > 0) wouldHit++;
-}
-static void noteReply(uint64_t key, int qend, int n) {
-  uint32_t ttl;
-  if (!key || !dnsMinTtl(buf, n, qend, &ttl) || !ttl) return;
-  if (ttl > 86400) ttl = 86400;
-  seen[(key >> 16) & (SEEN_SLOTS - 1)] = { key, millis() + ttl * 1000 };
-}
-static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend, uint64_t key) {
+static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend) {
   const int i = pendFree(pending, PEND_SLOTS);
   if (i < 0) return;
   PendingQuery& p = pending[i];
@@ -340,8 +323,7 @@ static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend, ui
   p.qend = qend < p.len ? qend : p.len;
   memcpy(p.pkt, buf, p.len);
   p.tries = qlen <= PEND_PKT ? 1 : 0;
-  p.cip = cip; p.cport = cport; p.up = upPref; p.sentTo = 1 << p.up; p.key = key;
-  noteForward(key);
+  p.cip = cip; p.cport = cport; p.up = upPref; p.sentTo = 1 << p.up;
   udpSend(upFd, p.up ? (uint32_t)UPSTREAM2 : (uint32_t)UPSTREAM, UPSTREAM_PORT, buf, qlen);
   p.sentAt = millis(); p.used = true;
 }
@@ -358,7 +340,6 @@ static bool pollUpstream() {
     PendingQuery& p = pending[i];
     buf[0] = p.cid >> 8; buf[1] = p.cid & 0xFF;
     udpSend(dnsFd, p.cip, p.cport, buf, n);
-    noteReply(p.key, p.qend, n);
     upPref = (uint8_t)up; p.used = false;
   }
   for (int i; (i = pendExpired(pending, PEND_SLOTS, millis(), UPSTREAM_TIMEOUT_MS)) >= 0; ) {
@@ -387,7 +368,7 @@ static bool handleDns() {
     Dev* c = getClient(cip);
     bool ban = c && c->banned;
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
-    if (!blocked) { forwardUpstream(cip, cport, qlen, dl ? qend : 12, dl ? fnv40(domain, dl) << 16 | qtype : 0); totalAllowed++; if (c) c->allowed++; continue; }
+    if (!blocked) { forwardUpstream(cip, cport, qlen, dl ? qend : 12); totalAllowed++; if (c) c->allowed++; continue; }
     int rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
     udpSend(dnsFd, cip, cport, buf, rlen);
   }
@@ -429,7 +410,7 @@ static void handleStats() {
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
-             ",\"heap\":" + ESP.getFreeHeap() + ",\"rxdrop\":" + rxDropped + ",\"wouldHit\":" + wouldHit + ",\"keyedFwd\":" + keyedFwd + ",\"ps\":" + (int)WiFi.getSleep() + ",\"gaps\":[" + gapList() + "]" + ",\"uptime\":\"" + ut + "\"" +
+             ",\"heap\":" + ESP.getFreeHeap() + ",\"rxdrop\":" + rxDropped + ",\"ps\":" + (int)WiFi.getSleep() + ",\"gaps\":[" + gapList() + "]" + ",\"uptime\":\"" + ut + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
