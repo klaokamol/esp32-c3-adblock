@@ -415,12 +415,14 @@ static bool commitNewBlocklist() {                  // /blocklist.new -> live (v
 
 // ---------- OTA blocklist update (browser upload) ----------
 static bool upOk = false;
+static bool upFull = false;
 static bool upAuthOk = false;
 static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+           upOk ? "ok" : upFull ? "rejected: blocklist does not fit the filesystem"
+                       : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -428,16 +430,17 @@ static void handleUpload() {
     case UPLOAD_FILE_START:
       upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
-      upOk = false; beginBlocklistSwap(web.clientContentLength());
+      upOk = false; upFull = false; beginBlocklistSwap(web.clientContentLength());
       upFile = LittleFS.open("/blocklist.new", "w");
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
-      if (upAuthOk && upFile) upFile.write(u.buf, u.currentSize);
+      if (upAuthOk && upFile && upFile.write(u.buf, u.currentSize) != u.currentSize) upFull = true;
       break;
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
+      if (upFull) LittleFS.remove("/blocklist.new");
       upOk = commitNewBlocklist();
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
       break;
@@ -478,17 +481,17 @@ static bool fetchBlocklist(String url) {
   File f = LittleFS.open("/blocklist.new", "w");
   if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
   WiFiClient* stream = http.getStreamPtr();
-  uint8_t b[1024]; size_t total = 0; uint32_t idle = millis(); bool stalled = false;
+  uint8_t b[1024]; size_t total = 0; uint32_t idle = millis(); bool stalled = false, full = false;
   while (http.connected() && (len < 0 || (int)total < len)) {
     bool dns = handleDns();
     size_t avail = stream->available();
-    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
+    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { if (f.write(b, n) != (size_t)n) { full = true; break; } total += n; idle = millis(); } }
     else { if (millis() - idle > 15000) { stalled = true; break; } if (!dns) delay(2); }
   }
   f.close(); http.end();
-  if (stalled || (len > 0 && total != (size_t)len)) {
+  if (stalled || full || (len > 0 && total != (size_t)len)) {
     LittleFS.remove("/blocklist.new"); reopenBlocklist();
-    updateStatus = "truncated (" + String(total) + "/" + String(len) + "B)";
+    updateStatus = (full ? "fs full (" : "truncated (") + String(total) + "/" + String(len) + "B)";
     Serial.printf("[remote] %s\n", updateStatus.c_str());
     return false;
   }
