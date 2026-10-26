@@ -401,6 +401,12 @@ static bool blobSorted(File& f) {
   while ((n = f.read(rangeBuf, sizeof(rangeBuf))) > 0) if (!hashesAscending(rangeBuf, n, &prev)) return false;
   return true;
 }
+static bool landed(size_t n) {
+  File f = LittleFS.open("/blocklist.new", "r");
+  size_t sz = f ? f.size() : 0;
+  if (f) f.close();
+  return sz == n;
+}
 static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
   File f = LittleFS.open("/blocklist.new", "r");
   size_t sz = f ? f.size() : 0;
@@ -435,11 +441,12 @@ static void handleUpload() {
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
-      if (upAuthOk && upFile && upFile.write(u.buf, u.currentSize) != u.currentSize) upFull = true;
+      if (upAuthOk && upFile) upFile.write(u.buf, u.currentSize);
       break;
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
+      upFull = !landed(u.totalSize);
       if (upFull) LittleFS.remove("/blocklist.new");
       upOk = commitNewBlocklist();
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
@@ -489,6 +496,7 @@ static bool fetchBlocklist(String url) {
     else { if (millis() - idle > 15000) { stalled = true; break; } if (!dns) delay(2); }
   }
   f.close(); http.end();
+  full = full || !landed(total);
   if (stalled || full || (len > 0 && total != (size_t)len)) {
     LittleFS.remove("/blocklist.new"); reopenBlocklist();
     updateStatus = (full ? "fs full (" : "truncated (") + String(total) + "/" + String(len) + "B)";
