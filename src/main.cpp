@@ -244,11 +244,12 @@ static int buildBlocked(int qend, uint16_t qtype) {
   const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
   memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
 }
-// Forward to upstream and wait for the reply that actually belongs to THIS query.
+// Forward to upstream without waiting: each query takes a pending slot under a fresh
+// random txid, and pollUpstream() relays the reply that actually belongs to it.
 // Issue #10: after one timeout the late reply used to sit in the socket and get relayed
-// to the next client (every answer shifted by one). Now: drain stale datagrams first,
-// send with a fresh random txid, and only accept a reply whose txid, question section,
-// and source address/port match. The client's own txid is restored on the way back.
+// to the next client (every answer shifted by one). Now a reply is only accepted when
+// its txid, question section, and source address/port match a pending query; anything
+// else is dropped. The client's own txid is restored on the way back.
 static uint8_t upPref = 0;
 static const int PEND_SLOTS = 16;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 500;
