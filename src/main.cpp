@@ -20,6 +20,8 @@
 #include "esp_task.h"
 #include <freertos/message_buffer.h>
 #include "pending.h"
+#include "dnsttl.h"
+#include "esp_private/wifi.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
 
@@ -299,7 +301,34 @@ static void udpSend(int fd, uint32_t ip, uint16_t port, const uint8_t* d, int n)
   sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = ip;
   sendto(fd, d, n, 0, (sockaddr*)&a, sizeof a);
 }
-static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend) {
+struct SeenName { uint64_t key; uint32_t until; };
+static const int SEEN_SLOTS = 256;
+static SeenName seen[SEEN_SLOTS];
+static uint32_t wouldHit = 0, keyedFwd = 0;
+static const uint32_t GAP_EDGES_MS[] = {50, 100, 300, 1000, 3000, 10000, 30000};
+static const int GAP_BUCKETS = sizeof(GAP_EDGES_MS) / sizeof(GAP_EDGES_MS[0]) + 1;
+static uint32_t gapHist[GAP_BUCKETS], lastQueryMs = 0;
+static void countGap(uint32_t now) {
+  if (lastQueryMs) {
+    int b = 0;
+    while (b < GAP_BUCKETS - 1 && now - lastQueryMs >= GAP_EDGES_MS[b]) b++;
+    gapHist[b]++;
+  }
+  lastQueryMs = now ? now : 1;
+}
+static void noteForward(uint64_t key) {
+  if (!key) return;
+  keyedFwd++;
+  const SeenName& e = seen[(key >> 16) & (SEEN_SLOTS - 1)];
+  if (e.key == key && (int32_t)(e.until - millis()) > 0) wouldHit++;
+}
+static void noteReply(uint64_t key, int qend, int n) {
+  uint32_t ttl;
+  if (!key || !dnsMinTtl(buf, n, qend, &ttl) || !ttl) return;
+  if (ttl > 86400) ttl = 86400;
+  seen[(key >> 16) & (SEEN_SLOTS - 1)] = { key, millis() + ttl * 1000 };
+}
+static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend, uint64_t key) {
   const int i = pendFree(pending, PEND_SLOTS);
   if (i < 0) return;
   PendingQuery& p = pending[i];
@@ -311,7 +340,8 @@ static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend) {
   p.qend = qend < p.len ? qend : p.len;
   memcpy(p.pkt, buf, p.len);
   p.tries = qlen <= PEND_PKT ? 1 : 0;
-  p.cip = cip; p.cport = cport; p.up = upPref; p.sentTo = 1 << p.up;
+  p.cip = cip; p.cport = cport; p.up = upPref; p.sentTo = 1 << p.up; p.key = key;
+  noteForward(key);
   udpSend(upFd, p.up ? (uint32_t)UPSTREAM2 : (uint32_t)UPSTREAM, UPSTREAM_PORT, buf, qlen);
   p.sentAt = millis(); p.used = true;
 }
@@ -328,6 +358,7 @@ static bool pollUpstream() {
     PendingQuery& p = pending[i];
     buf[0] = p.cid >> 8; buf[1] = p.cid & 0xFF;
     udpSend(dnsFd, p.cip, p.cport, buf, n);
+    noteReply(p.key, p.qend, n);
     upPref = (uint8_t)up; p.used = false;
   }
   for (int i; (i = pendExpired(pending, PEND_SLOTS, millis(), UPSTREAM_TIMEOUT_MS)) >= 0; ) {
@@ -350,12 +381,13 @@ static bool handleDns() {
     did = true;
     if (qlen < 13) continue;
     if ((buf[2] & 0xF8) != 0 || ((buf[4] << 8) | buf[5]) != 1) continue;
+    countGap(millis());
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
     Dev* c = getClient(cip);
     bool ban = c && c->banned;
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
-    if (!blocked) { forwardUpstream(cip, cport, qlen, dl ? qend : 12); totalAllowed++; if (c) c->allowed++; continue; }
+    if (!blocked) { forwardUpstream(cip, cport, qlen, dl ? qend : 12, dl ? fnv40(domain, dl) << 16 | qtype : 0); totalAllowed++; if (c) c->allowed++; continue; }
     int rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
     udpSend(dnsFd, cip, cport, buf, rlen);
   }
@@ -391,12 +423,13 @@ static String htmlEscape(const String& s) {
 #include "hashlist.h"
 static_assert(HASH_BYTES == 5, "hashlist.h assumes 5-byte hashes");
 
+static String gapList() { String g; for (int i = 0; i < GAP_BUCKETS; i++) { g += (i ? "," : ""); g += gapHist[i]; } return g; }
 static void handleStats() {
   uint32_t up = millis() / 1000;
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
-             ",\"heap\":" + ESP.getFreeHeap() + ",\"rxdrop\":" + rxDropped + ",\"uptime\":\"" + ut + "\"" +
+             ",\"heap\":" + ESP.getFreeHeap() + ",\"rxdrop\":" + rxDropped + ",\"wouldHit\":" + wouldHit + ",\"keyedFwd\":" + keyedFwd + ",\"ps\":" + (int)WiFi.getSleep() + ",\"gaps\":[" + gapList() + "]" + ",\"uptime\":\"" + ut + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
@@ -717,6 +750,12 @@ void setup() {
     long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
     blockingOn = false; resumeAt = (s > 0) ? millis() + (uint32_t)s * 1000UL : 0;
     web.send(200, "text/plain", "paused");
+  });
+  web.on("/ps", []() {
+    if (!requireAuth()) return;
+    if (web.hasArg("m")) WiFi.setSleep(web.arg("m") == "none" ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+    if (web.hasArg("a")) esp_wifi_set_sleep_min_active_time((uint32_t)web.arg("a").toInt() * 1000);
+    web.send(200, "text/plain", "ok");
   });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
   web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");

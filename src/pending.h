@@ -8,6 +8,7 @@ struct PendingQuery {
   bool used;
   uint16_t wid, cid, len, qend, cport;
   uint8_t up, sentTo, tries;
+  uint64_t key;
   uint32_t cip, sentAt;
   uint8_t pkt[PEND_PKT];
 };
