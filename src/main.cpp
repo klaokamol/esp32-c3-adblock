@@ -5,7 +5,6 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
@@ -17,6 +16,9 @@
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/sockets.h"
+#include "esp_task.h"
+#include <freertos/message_buffer.h>
 #include "pending.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
@@ -42,7 +44,6 @@ static const int CACHE_SIZE = 256;       // must be power of 2
 static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
 
 // ---- globals ----
-WiFiUDP dnsServer, upstreamCli;
 WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
@@ -254,6 +255,50 @@ static uint8_t upPref = 0;
 static const int PEND_SLOTS = 16;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 500;
 static PendingQuery pending[PEND_SLOTS];
+struct RxHdr { uint32_t ip; uint16_t port; };
+static int dnsFd = -1, upFd = -1;
+static MessageBufferHandle_t dnsRx, upRx;
+static volatile uint32_t rxDropped = 0;
+static void rxTask(void* arg) {
+  const int fd = (int)(intptr_t)arg;
+  MessageBufferHandle_t mb = fd == dnsFd ? dnsRx : upRx;
+  uint8_t m[sizeof(RxHdr) + sizeof(buf) + 1];
+  for (;;) {
+    sockaddr_in from; socklen_t fl = sizeof(from);
+    int n = recvfrom(fd, m + sizeof(RxHdr), sizeof(buf) + 1, 0, (sockaddr*)&from, &fl);
+    if (n < 0) { vTaskDelay(1); continue; }
+    if (n > (int)sizeof(buf)) continue;
+    RxHdr h = { from.sin_addr.s_addr, ntohs(from.sin_port) };
+    memcpy(m, &h, sizeof h);
+    if (!xMessageBufferSend(mb, m, sizeof h + n, 0)) rxDropped++;
+  }
+}
+static int udpOpen(uint16_t port) {
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (fd >= 0 && bind(fd, (sockaddr*)&a, sizeof a) == 0) return fd;
+  Serial.printf("[dns] socket on :%u failed\n", port);
+  if (fd >= 0) close(fd);
+  return -1;
+}
+static void dnsBegin() {
+  dnsFd = udpOpen(DNS_PORT); upFd = udpOpen(0);
+  dnsRx = xMessageBufferCreate(4096); upRx = xMessageBufferCreate(8192);
+  if (dnsFd >= 0) xTaskCreate(rxTask, "dnsrx", 4096, (void*)(intptr_t)dnsFd, ESP_TASK_TCPIP_PRIO + 1, nullptr);
+  if (upFd >= 0) xTaskCreate(rxTask, "uprx", 4096, (void*)(intptr_t)upFd, ESP_TASK_TCPIP_PRIO + 1, nullptr);
+}
+static int rxNext(MessageBufferHandle_t mb, uint32_t* ip, uint16_t* port) {
+  static uint8_t m[sizeof(RxHdr) + sizeof(buf)];
+  size_t n = xMessageBufferReceive(mb, m, sizeof m, 0);
+  if (n < sizeof(RxHdr)) return -1;
+  RxHdr h; memcpy(&h, m, sizeof h); *ip = h.ip; *port = h.port;
+  memcpy(buf, m + sizeof h, n - sizeof h);
+  return n - sizeof h;
+}
+static void udpSend(int fd, uint32_t ip, uint16_t port, const uint8_t* d, int n) {
+  sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = ip;
+  sendto(fd, d, n, 0, (sockaddr*)&a, sizeof a);
+}
 static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend) {
   const int i = pendFree(pending, PEND_SLOTS);
   if (i < 0) return;
@@ -267,31 +312,29 @@ static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend) {
   memcpy(p.pkt, buf, p.len);
   p.tries = qlen <= PEND_PKT ? 1 : 0;
   p.cip = cip; p.cport = cport; p.up = upPref; p.sentTo = 1 << p.up;
-  upstreamCli.beginPacket(p.up ? UPSTREAM2 : UPSTREAM, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
+  udpSend(upFd, p.up ? (uint32_t)UPSTREAM2 : (uint32_t)UPSTREAM, UPSTREAM_PORT, buf, qlen);
   p.sentAt = millis(); p.used = true;
 }
 static bool pollUpstream() {
   bool did = false;
   for (int budget = 0; budget < 16; budget++) {
-    int sz = upstreamCli.parsePacket(); if (sz <= 0) break;
+    uint32_t from; uint16_t port;
+    int n = rxNext(upRx, &from, &port); if (n < 0) break;
     did = true;
-    const IPAddress from = upstreamCli.remoteIP();
-    const int up = upstreamCli.remotePort() != UPSTREAM_PORT ? -1 : from == UPSTREAM ? 0 : from == UPSTREAM2 ? 1 : -1;
-    int n = upstreamCli.read(buf, sizeof(buf));
-    upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
-    if (up < 0 || sz > (int)sizeof(buf)) continue;
+    const int up = port != UPSTREAM_PORT ? -1 : from == (uint32_t)UPSTREAM ? 0 : from == (uint32_t)UPSTREAM2 ? 1 : -1;
+    if (up < 0) continue;
     const int i = pendMatch(pending, PEND_SLOTS, (uint8_t)up, buf, n);
     if (i < 0) continue;
     PendingQuery& p = pending[i];
     buf[0] = p.cid >> 8; buf[1] = p.cid & 0xFF;
-    dnsServer.beginPacket(IPAddress(p.cip), p.cport); dnsServer.write(buf, n); dnsServer.endPacket();
+    udpSend(dnsFd, p.cip, p.cport, buf, n);
     upPref = (uint8_t)up; p.used = false;
   }
   for (int i; (i = pendExpired(pending, PEND_SLOTS, millis(), UPSTREAM_TIMEOUT_MS)) >= 0; ) {
     PendingQuery& p = pending[i];
     if (!p.tries) { p.used = false; continue; }
     p.tries--; p.up ^= 1; p.sentTo |= 1 << p.up;
-    upstreamCli.beginPacket(p.up ? UPSTREAM2 : UPSTREAM, UPSTREAM_PORT); upstreamCli.write(p.pkt, p.len); upstreamCli.endPacket();
+    udpSend(upFd, p.up ? (uint32_t)UPSTREAM2 : (uint32_t)UPSTREAM, UPSTREAM_PORT, p.pkt, p.len);
     p.sentAt = millis();
   }
   return did;
@@ -302,19 +345,19 @@ static bool handleDns() {
   bool did = false;
   for (int budget = 0; budget < 16 && pendFree(pending, PEND_SLOTS) >= 0; budget++) {
     if (pollUpstream()) did = true;
-    int sz = dnsServer.parsePacket(); if (sz <= 0) break;
+    uint32_t cip; uint16_t cport;
+    int qlen = rxNext(dnsRx, &cip, &cport); if (qlen < 0) break;
     did = true;
-    IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
+    if (qlen < 13) continue;
     if ((buf[2] & 0xF8) != 0 || ((buf[4] << 8) | buf[5]) != 1) continue;
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
-    Dev* c = getClient((uint32_t)cip);
+    Dev* c = getClient(cip);
     bool ban = c && c->banned;
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
-    if (!blocked) { forwardUpstream((uint32_t)cip, cport, qlen, dl ? qend : 12); totalAllowed++; if (c) c->allowed++; continue; }
+    if (!blocked) { forwardUpstream(cip, cport, qlen, dl ? qend : 12); totalAllowed++; if (c) c->allowed++; continue; }
     int rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
-    dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket();
+    udpSend(dnsFd, cip, cport, buf, rlen);
   }
   return pollUpstream() || did;
 }
@@ -353,7 +396,7 @@ static void handleStats() {
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
-             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
+             ",\"heap\":" + ESP.getFreeHeap() + ",\"rxdrop\":" + rxDropped + ",\"uptime\":\"" + ut + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
@@ -662,7 +705,7 @@ void setup() {
                     "(they're in the repo's example file). Set real values before trusting this "
                     "device on a network you don't fully control.");
 
-  dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+  dnsBegin();
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
