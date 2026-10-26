@@ -376,6 +376,12 @@ static void beginBlocklistSwap() {
   LittleFS.remove(BLOCKLIST_PATH);
   LittleFS.remove("/blocklist.new");
 }
+static bool landed(size_t n) {
+  File f = LittleFS.open("/blocklist.new", "r");
+  size_t sz = f ? f.size() : 0;
+  if (f) f.close();
+  return sz == n;
+}
 static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
   File f = LittleFS.open("/blocklist.new", "r");
   size_t sz = f ? f.size() : 0; if (f) f.close();
@@ -408,11 +414,12 @@ static void handleUpload() {
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
-      if (upAuthOk && upFile && upFile.write(u.buf, u.currentSize) != u.currentSize) upFull = true;
+      if (upAuthOk && upFile) upFile.write(u.buf, u.currentSize);
       break;
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
+      upFull = !landed(u.totalSize);
       if (upFull) LittleFS.remove("/blocklist.new");
       upOk = commitNewBlocklist();
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
@@ -459,6 +466,7 @@ static bool fetchBlocklist(String url) {
     else { if (millis() - idle > 15000) break; delay(2); }
   }
   f.close(); http.end();
+  full = full || !landed(total);
   if (full) {
     LittleFS.remove("/blocklist.new"); reopenBlocklist();
     updateStatus = "fs full (" + String(total) + "/" + String(len) + "B)";
