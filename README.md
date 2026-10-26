@@ -111,7 +111,7 @@ can't be downloaded the build stops instead of silently producing a smaller list
 ### WiFi setup (no re-flash needed)
 
 If it can't connect (or you never set `secrets.h`), it starts an open access point
-**`C3-AdBlock-XXXX`** with a captive portal — join it from a phone, pick your network,
+**`C3-AdBlock`** with a captive portal — join it from a phone, pick your network,
 type the password, done. To move it to a new network later: click **Forget WiFi** on
 the dashboard, or hold the **BOOT** button while powering on, and the setup portal
 comes back. (`/forgetwifi` requires auth now, so it's no longer a bare URL you can
@@ -183,7 +183,7 @@ and shows a banner on the dashboard when this is the case — but it will still
 boot and run, so don't skip setting real values in `secrets.h` before trusting
 this on a network you don't fully control.
 
-Out of scope for now: the WiFi setup portal's access point (`C3-AdBlock-XXXX`)
+Out of scope for now: the WiFi setup portal's access point (`C3-AdBlock`)
 is still open (unencrypted) by design — it needs to be joinable without knowing
 a password first. The real WiFi password you type into the portal is only as
 safe as that local radio link during the brief setup window.
