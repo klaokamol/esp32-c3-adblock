@@ -625,13 +625,14 @@ static bool connectWiFi() {
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
+  WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) {
+    esp_wifi_set_sleep_min_active_time(WIFI_AWAKE_MS * 1000);  // ponytail: private IDF API (esp_private/wifi.h), may vanish on an IDF bump; then set CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME in a custom sdkconfig build
+  }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.mode(WIFI_STA); WiFi.setSleep(WIFI_PS_MIN_MODEM); WiFi.begin(ssid, pass);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
   Serial.println();
-  if (WiFi.status() != WL_CONNECTED) return false;
-  esp_wifi_set_sleep_min_active_time(WIFI_AWAKE_MS * 1000);  // ponytail: private IDF API (esp_private/wifi.h), may vanish on an IDF bump; then set CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME in a custom sdkconfig build
-  return true;
+  return WiFi.status() == WL_CONNECTED;
 }
 
 static void handlePortalRoot() {
