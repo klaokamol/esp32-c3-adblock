@@ -292,6 +292,7 @@ static bool handleDns() {
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
     int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
+    if ((buf[2] & 0xF8) != 0 || ((buf[4] << 8) | buf[5]) != 1) continue;
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
     Dev* c = getClient((uint32_t)cip);
