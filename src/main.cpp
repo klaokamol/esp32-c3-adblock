@@ -17,6 +17,7 @@
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "pending.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
 
@@ -249,45 +250,56 @@ static int buildBlocked(int qend, uint16_t qtype) {
 // send with a fresh random txid, and only accept a reply whose txid, question section,
 // and source address/port match. The client's own txid is restored on the way back.
 static uint8_t upPref = 0;
-static int forwardUpstream(int qlen, int qend) {
-  upstreamCli.flush();                                   // release any half-read buffer
-  while (upstreamCli.parsePacket() > 0) upstreamCli.flush();   // drop stale late replies
-  const uint8_t cid0 = buf[0], cid1 = buf[1];
-  const uint16_t wid = (uint16_t)esp_random();
-  uint8_t q[260]; int ql = qend - 12;
-  const bool haveQ = ql > 0 && ql <= (int)sizeof(q) && qend <= qlen;
-  if (haveQ) memcpy(q, buf + 12, ql);
+static const int PEND_SLOTS = 16;
+static const uint32_t UPSTREAM_TIMEOUT_MS = 500;
+static PendingQuery pending[PEND_SLOTS];
+static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend) {
+  const int i = pendFree(pending, PEND_SLOTS);
+  if (i < 0) return;
+  PendingQuery& p = pending[i];
+  uint16_t wid;
+  do wid = (uint16_t)esp_random(); while (pendWidUsed(pending, PEND_SLOTS, wid));
+  p.cid = (uint16_t)(buf[0] << 8 | buf[1]); p.wid = wid;
   buf[0] = wid >> 8; buf[1] = wid & 0xFF;
-  static uint8_t sent[512];
-  const int tries = qlen <= (int)sizeof(sent) ? 2 : 1;
-  if (tries == 2) memcpy(sent, buf, qlen);
-  for (int a = 0; a < tries; a++) {
-    const uint8_t s = upPref ^ a;
-    const IPAddress up = s ? UPSTREAM2 : UPSTREAM;
-    if (a) memcpy(buf, sent, qlen);
-    upstreamCli.beginPacket(up, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
-    const uint32_t t0 = millis();
-    while (millis() - t0 < 500) {                       // deadline, not a retry count
-      int sz = upstreamCli.parsePacket();
-      if (sz <= 0) { delay(1); continue; }
-      const bool fromUp = upstreamCli.remoteIP() == up && upstreamCli.remotePort() == UPSTREAM_PORT;
-      int n = upstreamCli.read(buf, sizeof(buf));
-      upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
-      if (!fromUp || n < 12 || sz > (int)sizeof(buf)) continue;
-      if (buf[0] != (wid >> 8) || buf[1] != (wid & 0xFF)) continue;
-      if (haveQ && (n < 12 + ql || memcmp(buf + 12, q, ql) != 0)) continue;
-      buf[0] = cid0; buf[1] = cid1;
-      upPref = s;
-      return n;
-    }
+  p.len = qlen < PEND_PKT ? qlen : PEND_PKT;
+  p.qend = qend < p.len ? qend : p.len;
+  memcpy(p.pkt, buf, p.len);
+  p.tries = qlen <= PEND_PKT ? 1 : 0;
+  p.cip = cip; p.cport = cport; p.up = upPref; p.sentTo = 1 << p.up;
+  upstreamCli.beginPacket(p.up ? UPSTREAM2 : UPSTREAM, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
+  p.sentAt = millis(); p.used = true;
+}
+static bool pollUpstream() {
+  bool did = false;
+  for (int budget = 0; budget < 16; budget++) {
+    int sz = upstreamCli.parsePacket(); if (sz <= 0) break;
+    did = true;
+    const IPAddress from = upstreamCli.remoteIP();
+    const int up = upstreamCli.remotePort() != UPSTREAM_PORT ? -1 : from == UPSTREAM ? 0 : from == UPSTREAM2 ? 1 : -1;
+    int n = upstreamCli.read(buf, sizeof(buf));
+    upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
+    if (up < 0 || sz > (int)sizeof(buf)) continue;
+    const int i = pendMatch(pending, PEND_SLOTS, (uint8_t)up, buf, n);
+    if (i < 0) continue;
+    PendingQuery& p = pending[i];
+    buf[0] = p.cid >> 8; buf[1] = p.cid & 0xFF;
+    dnsServer.beginPacket(IPAddress(p.cip), p.cport); dnsServer.write(buf, n); dnsServer.endPacket();
+    upPref = (uint8_t)up; p.used = false;
   }
-  return 0;
+  for (int i; (i = pendExpired(pending, PEND_SLOTS, millis(), UPSTREAM_TIMEOUT_MS)) >= 0; ) {
+    PendingQuery& p = pending[i];
+    if (!p.tries) { p.used = false; continue; }
+    p.tries--; p.up ^= 1; p.sentTo |= 1 << p.up;
+    upstreamCli.beginPacket(p.up ? UPSTREAM2 : UPSTREAM, UPSTREAM_PORT); upstreamCli.write(p.pkt, p.len); upstreamCli.endPacket();
+    p.sentAt = millis();
+  }
+  return did;
 }
 // Drain a whole RX burst per call (capped, so web/OTA still get a turn) instead of
 // one packet per loop iteration. Returns true if any query was handled this call.
 static bool handleDns() {
   bool did = false;
-  for (int budget = 0; budget < 16; budget++) {
+  for (int budget = 0; budget < 16 && pendFree(pending, PEND_SLOTS) >= 0; budget++) {
     int sz = dnsServer.parsePacket(); if (sz <= 0) break;
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
@@ -298,12 +310,11 @@ static bool handleDns() {
     Dev* c = getClient((uint32_t)cip);
     bool ban = c && c->banned;
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
-    int rlen;
-    if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-    else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
-    if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+    if (!blocked) { forwardUpstream((uint32_t)cip, cport, qlen, dl ? qend : 12); totalAllowed++; if (c) c->allowed++; continue; }
+    int rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
+    dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket();
   }
-  return did;
+  return pollUpstream() || did;
 }
 
 // ---------- web ----------
