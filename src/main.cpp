@@ -634,6 +634,7 @@ static bool hasCreds() {
   prefs.begin("wifi", true); bool nvs = prefs.getString("ssid", "").length() > 0; prefs.end();
   return nvs || (WIFI_SSID && *WIFI_SSID && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0);
 }
+static const uint32_t WIFI_AWAKE_MS = 300;
 static bool connectWiFi() {
   prefs.begin("wifi", true);
   String ss = prefs.getString("ssid", "");
@@ -647,7 +648,9 @@ static bool connectWiFi() {
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
   Serial.println();
-  return WiFi.status() == WL_CONNECTED;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  esp_wifi_set_sleep_min_active_time(WIFI_AWAKE_MS * 1000);  // ponytail: private IDF API (esp_private/wifi.h), may vanish on an IDF bump; then set CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME in a custom sdkconfig build
+  return true;
 }
 
 static void handlePortalRoot() {
