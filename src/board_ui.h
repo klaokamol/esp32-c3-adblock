@@ -30,6 +30,10 @@ static inline bool nightActive(uint8_t mode, int hour, int from, int to) {
   return from <= to ? hour >= from && hour < to : hour >= from || hour < to;
 }
 
+static inline bool updateDue(uint8_t days, int dow, int hour, int atHour, int day, int lastDay) {
+  return (days >> dow & 1) && hour >= atHour && day != lastDay;
+}
+
 static const uint32_t SCREEN_MS = 60000;
 
 static inline bool screenAwake(uint32_t now, uint32_t lastWake) {

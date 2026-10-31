@@ -71,6 +71,9 @@ uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
 String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
 uint32_t updateIntervalH = 24;      // hours between auto-fetches
 uint32_t lastCheckMs = 0;
+uint8_t  updateDays = 0;            // bit0 Sun..bit6 Sat; 0 = use updateIntervalH instead
+uint8_t  updateHour = 3;
+int      lastSchedDay = -1;
 String updateStatus = "never";
 
 // WiFi provisioning (captive portal)
@@ -407,9 +410,16 @@ static String htmlEscape(const String& s) {
 #include "hashlist.h"
 static_assert(HASH_BYTES == 5, "hashlist.h assumes 5-byte hashes");
 
-static int nightLocalHour(int tzHours) {
+static bool localClock(int tzHours, int& day, int& hour) {
   time_t t = time(nullptr);
-  return t < 1700000000 ? -1 : (int)((t / 3600 + tzHours + 24) % 24);
+  if (t < 1700000000) return false;
+  time_t l = t + tzHours * 3600;
+  day = (int)(l / 86400); hour = (int)(l / 3600 % 24);
+  return true;
+}
+static int nightLocalHour(int tzHours) {
+  int d, h;
+  return localClock(tzHours, d, h) ? h : -1;
 }
 
 static String gapList() { String g; for (int i = 0; i < GAP_BUCKETS; i++) { g += (i ? "," : ""); g += gapHist[i]; } return g; }
@@ -419,7 +429,7 @@ static void handleStats() {
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"rxdrop\":" + rxDropped + ",\"ps\":" + (int)WiFi.getSleep() + ",\"gaps\":[" + gapList() + "]" + ",\"uptime\":\"" + ut + "\"" +
-             ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
+             ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"updays\":" + updateDays + ",\"uphour\":" + updateHour + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"nmode\":" + nightMode + ",\"nfrom\":" + nightFrom + ",\"nto\":" + nightTo + ",\"ntz\":" + nightTz + ",\"nhour\":" + nightLocalHour(nightTz) +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
@@ -708,7 +718,7 @@ void setup() {
     buildFlashIndex();
   }
   loadCustom(); loadBanned(); loadUpdateCfg();
-  prefs.begin("ui", true); nightMode = prefs.getUChar("night", 0); nightFrom = prefs.getUChar("from", 22); nightTo = prefs.getUChar("to", 7); nightTz = prefs.getChar("tz", 7); prefs.end();
+  prefs.begin("ui", true); nightMode = prefs.getUChar("night", 0); nightFrom = prefs.getUChar("from", 22); nightTo = prefs.getUChar("to", 7); nightTz = prefs.getChar("tz", 7); updateDays = prefs.getUChar("ud", 0); updateHour = prefs.getUChar("uh", 3); prefs.end();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
@@ -772,6 +782,9 @@ void setup() {
     if (!requireAuth()) return;
     if (web.hasArg("u")) updateUrl = web.arg("u");
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
+    if (web.hasArg("d")) updateDays = constrain(web.arg("d").toInt(), 0, 127);
+    if (web.hasArg("hr")) updateHour = constrain(web.arg("hr").toInt(), 0, 23);
+    prefs.begin("ui", false); prefs.putUChar("ud", updateDays); prefs.putUChar("uh", updateHour); prefs.end();
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.begin();
@@ -789,7 +802,14 @@ void loop() {
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
-    if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
+    int day, hour;
+    if (updateDays) {
+      if (localClock(nightTz, day, hour) && updateDue(updateDays, (day + 4) % 7, hour, updateHour, day, lastSchedDay) && now - lastCheckMs >= 600000UL) {
+        lastCheckMs = now;
+        if (fetchBlocklist(updateUrl) || numHashes > 0) lastSchedDay = day;
+      }
+    }
+    else if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
     else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; if (!fetchBlocklist(updateUrl) && numHashes == 0) lastCheckMs -= updateIntervalH * 3600000UL - 600000UL; }
   }
   if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
