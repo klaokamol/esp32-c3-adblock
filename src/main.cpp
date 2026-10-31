@@ -81,6 +81,9 @@ String      portalOpts;             // <option> list of scanned networks, built 
 // blocking pause (Pi-hole-style "disable for a while")
 bool     blockingOn = true;
 uint32_t resumeAt   = 0;            // millis() to auto-resume; 0 = paused indefinitely / not paused
+uint8_t  nightMode  = 0;
+uint8_t  nightFrom  = 22, nightTo = 7;
+int8_t   nightTz    = 7;            // hours from UTC
 
 // ---------- hashing / matching ----------
 static uint64_t fnv40(const char* s, size_t n) {
@@ -404,6 +407,11 @@ static String htmlEscape(const String& s) {
 #include "hashlist.h"
 static_assert(HASH_BYTES == 5, "hashlist.h assumes 5-byte hashes");
 
+static int nightLocalHour(int tzHours) {
+  time_t t = time(nullptr);
+  return t < 1700000000 ? -1 : (int)((t / 3600 + tzHours + 24) % 24);
+}
+
 static String gapList() { String g; for (int i = 0; i < GAP_BUCKETS; i++) { g += (i ? "," : ""); g += gapHist[i]; } return g; }
 static void handleStats() {
   uint32_t up = millis() / 1000;
@@ -629,6 +637,7 @@ static bool connectWiFi() {
     esp_wifi_set_sleep_min_active_time(WIFI_AWAKE_MS * 1000);  // ponytail: private IDF API (esp_private/wifi.h), may vanish on an IDF bump; then set CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME in a custom sdkconfig build
   }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.mode(WIFI_STA); WiFi.setSleep(WIFI_PS_MIN_MODEM); WiFi.begin(ssid, pass);
+  configTime(0, 0, "pool.ntp.org");
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
   Serial.println();
@@ -698,6 +707,7 @@ void setup() {
     buildFlashIndex();
   }
   loadCustom(); loadBanned(); loadUpdateCfg();
+  prefs.begin("ui", true); nightMode = prefs.getUChar("night", 0); nightFrom = prefs.getUChar("from", 22); nightTo = prefs.getUChar("to", 7); nightTz = prefs.getChar("tz", 7); prefs.end();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
@@ -742,6 +752,15 @@ void setup() {
     if (web.hasArg("a")) esp_wifi_set_sleep_min_active_time((uint32_t)web.arg("a").toInt() * 1000);
     web.send(200, "text/plain", "ok");
   });
+  web.on("/night", []() {
+    if (!requireAuth()) return;
+    if (web.hasArg("m")) nightMode = constrain(web.arg("m").toInt(), 0, 2);
+    if (web.hasArg("from")) nightFrom = constrain(web.arg("from").toInt(), 0, 23);
+    if (web.hasArg("to")) nightTo = constrain(web.arg("to").toInt(), 0, 23);
+    if (web.hasArg("tz")) nightTz = constrain(web.arg("tz").toInt(), -12, 14);
+    if (web.args()) { prefs.begin("ui", false); prefs.putUChar("night", nightMode); prefs.putUChar("from", nightFrom); prefs.putUChar("to", nightTo); prefs.putChar("tz", nightTz); prefs.end(); }
+    web.send(200, "text/plain", String(nightMode) + " " + nightFrom + "-" + nightTo + " tz" + nightTz + (nightLocalHour(nightTz) < 0 ? " nosync" : ""));
+  });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
   web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");
     prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
@@ -765,7 +784,7 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
-  uiTick(totalBlocked, totalAllowed, numClients, numHashes, !blockingOn);
+  uiTick(totalBlocked, totalAllowed, numClients, numHashes, !blockingOn, nightActive(nightMode, nightLocalHour(nightTz), nightFrom, nightTo));
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();

@@ -14,6 +14,8 @@ int main() {
   unsigned long u[] = {0, 3599, 3600, 172799, 172800, 99999999};
   for (unsigned long v : u) { fmtUptime(o, sizeof o, v); printf("%s\n", o); }
   printf("%d%d%d%d%d%d%d\n", ledOn(5000, true, false), ledOn(0, false, false), ledOn(250, false, false), ledOn(0, false, true), ledOn(100, false, true), ledOn(5000, false, true), ledOn(4999, false, true));
+  printf("%d%d%d\n", ledOn(5000, true, false, true), ledOn(0, false, false, true), ledOn(0, false, true, true));
+  printf("%d%d%d%d%d%d%d\n", nightActive(1, -1, 22, 7), nightActive(0, 23, 22, 7), nightActive(2, -1, 22, 7), nightActive(2, 23, 22, 7) && nightActive(2, 6, 22, 7) && !nightActive(2, 7, 22, 7), nightActive(2, 21, 22, 7), nightActive(2, 1, 1, 5) && !nightActive(2, 5, 1, 5), nightActive(2, 0, 1, 5));
   printf("%d%d%d%d\n", screenAwake(59999, 0), screenAwake(60000, 0), screenAwake(100, 4294967000UL), wakeEvent(true, false, false, false) && !wakeEvent(true, true, false, false) && wakeEvent(false, false, true, false));
   int r[] = {-30, -55, -59, -65, -70, -75, -80, -85, -90};
   for (int v : r) printf("%d\n", rssiBars(v));
@@ -33,8 +35,10 @@ class BoardUi(unittest.TestCase):
         self.assertTrue(all(len(c) <= 4 for c in counts))
         self.assertEqual(out[12:18], ["0m", "59m", "1h", "47h", "2d", "999d"])
         self.assertEqual(out[18], "1101010")
-        self.assertEqual(out[19], "1011")
-        self.assertEqual(out[20:], ["3", "3", "3", "2", "2", "1", "1", "0", "0"])
+        self.assertEqual(out[19], "110")
+        self.assertEqual(out[20], "1001010")
+        self.assertEqual(out[21], "1011")
+        self.assertEqual(out[22:], ["3", "3", "3", "2", "2", "1", "1", "0", "0"])
 
 
 if __name__ == "__main__":
