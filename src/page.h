@@ -41,6 +41,11 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <h2>FIRMWARE &mdash; OTA UPDATE</h2>
 <form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
+<h2>STATUS LED &mdash; NIGHT MODE</h2>
+<div id=nbox style=margin-bottom:6px><select id=nmode style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:5px"><option value=0>Day (LED blinks)</option><option value=1>Night (LED quiet)</option><option value=2>Auto (follow schedule)</option></select>
+quiet from <input id=nfrom size=2> &ndash; <input id=nto size=2> h, UTC+<input id=ntz size=2>
+<button onclick=saveNight()>Save</button> <span id=nmsg style=color:#8b949e></span></div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">hides only the idle heartbeat; paused and no-WiFi states stay visible. auto needs NTP, clock: <span id=nclk>&mdash;</span></div>
 <h2>WIFI</h2>
 <div style=margin-bottom:18px><button onclick="if(confirm('Forget saved WiFi and reboot into the setup portal?'))forgetWifi()">Forget WiFi</button></div>
 </div><script>
@@ -69,7 +74,10 @@ ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a
 cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
-ustat.textContent=s.upstat||'—';}
+ustat.textContent=s.upstat||'—';
+if(!nbox.contains(document.activeElement)){nmode.value=s.nmode;nfrom.value=s.nfrom;nto.value=s.nto;ntz.value=s.ntz;}
+nclk.textContent=s.nhour<0?'not synced':s.nhour+':00 local';}
+function saveNight(){fetch('/night?m='+nmode.value+'&from='+(parseInt(nfrom.value)||0)+'&to='+(parseInt(nto.value)||0)+'&tz='+(parseInt(ntz.value)||0),{headers:CSRF_HDRS}).then(()=>{nmsg.textContent='saved';setTimeout(()=>nmsg.textContent='',1500);load()})}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{dom.value='';load()})}}
 ct.addEventListener('click',e=>{if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load)});
 cl.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/unblock?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
