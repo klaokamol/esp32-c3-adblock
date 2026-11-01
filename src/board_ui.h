@@ -20,8 +20,18 @@ static inline int rssiBars(int rssi) {
   return rssi > -60 ? 3 : rssi > -75 ? 2 : rssi > -85 ? 1 : 0;
 }
 
-static inline bool ledOn(uint32_t t, bool paused, bool wifi) {
-  return paused ? true : !wifi ? (t / 250) % 2 == 0 : (t % 5000) < 60;
+static inline bool ledOn(uint32_t t, bool paused, bool wifi, bool night = false) {
+  return paused ? true : !wifi ? (t / 250) % 2 == 0 : !night && (t % 5000) < 60;
+}
+
+static inline bool nightActive(uint8_t mode, int hour, int from, int to) {
+  if (mode == 1) return true;
+  if (mode != 2 || hour < 0) return false;
+  return from <= to ? hour >= from && hour < to : hour >= from || hour < to;
+}
+
+static inline bool updateDue(uint8_t days, int dow, int hour, int atHour, int day, int lastDay) {
+  return (days >> dow & 1) && hour >= atHour && day != lastDay;
 }
 
 static const uint32_t SCREEN_MS = 60000;
@@ -113,10 +123,10 @@ static void oledLines(const char* a, const char* b = "", const char* c = "", con
   oledFlush();
 }
 
-static void uiTick(uint32_t blocked, uint32_t allowed, int clients, uint32_t domains, bool paused) {
+static void uiTick(uint32_t blocked, uint32_t allowed, int clients, uint32_t domains, bool paused, bool night) {
   static bool prevLow = false, prevPaused = false;
   uint32_t now = millis();
-  digitalWrite(LED_PIN, ledOn(now, paused, WiFi.status() == WL_CONNECTED) ? LOW : HIGH);
+  digitalWrite(LED_PIN, ledOn(now, paused, WiFi.status() == WL_CONNECTED, night) ? LOW : HIGH);
   bool low = btnPin >= 0 && digitalRead(btnPin) == LOW;
   bool wake = wakeEvent(low, prevLow, paused, prevPaused);
   prevLow = low; prevPaused = paused;
@@ -150,5 +160,5 @@ static void uiTick(uint32_t blocked, uint32_t allowed, int clients, uint32_t dom
 static inline void uiBegin() {}
 static inline void uiButton(int) {}
 static inline void oledLines(const char*, const char* = "", const char* = "", const char* = "") {}
-static inline void uiTick(uint32_t, uint32_t, int, uint32_t, bool) {}
+static inline void uiTick(uint32_t, uint32_t, int, uint32_t, bool, bool) {}
 #endif
