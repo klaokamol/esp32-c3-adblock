@@ -21,6 +21,7 @@
 #include <freertos/message_buffer.h>
 #include "pending.h"
 #include "banlist.h"
+#include "input.h"
 #include "esp_private/wifi.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
@@ -184,23 +185,25 @@ static bool isBlocked(const char* domain) {
 }
 
 // ---------- persistence ----------
+static String normDom(const String& d) {
+  if (d.length() > 260) return "";
+  char b[261]; d.toCharArray(b, sizeof b); normDomain(b); return String(b);
+}
 static void loadCustom() {
   numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
   while (f.available() && numCustom < MAX_CUSTOM) {
-    String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
-    if (l.length() && l.indexOf('.') > 0) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    String l = normDom(f.readStringUntil('\n'));
+    if (l.length() && l.indexOf('.') > 0 && !hasCtl(l.c_str())) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
   }
   f.close();
 }
 static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
-static bool addCustom(String d) {
-  d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
+static bool addCustom(const String& d) {
+  if (!d.length() || d.length() > 253 || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
   customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
 }
-static void removeCustom(String d) {
-  d.toLowerCase();
+static void removeCustom(const String& d) {
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) {
     for (int j = i; j < numCustom - 1; j++) { customDom[j] = customDom[j+1]; customHash[j] = customHash[j+1]; }
     numCustom--; saveCustom(); return;
@@ -390,7 +393,15 @@ static bool handleDns() {
 
 // ---------- web ----------
 static String macStr(const uint8_t* m) { if (macUnknown(m)) return "—"; char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
-static String jesc(const String& s) { String o; for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; } return o; }
+static String jesc(const String& s) {
+  String o;
+  for (char ch : s) {
+    if (ch == '"' || ch == '\\') { o += '\\'; o += ch; }
+    else if ((uint8_t)ch < 0x20 || ch == 0x7f) { char e[7]; snprintf(e, sizeof e, "\\u%04x", (uint8_t)ch); o += e; }
+    else o += ch;
+  }
+  return o;
+}
 // HTML text/attribute escaping for the setup portal. jesc() covers JSON (stats
 // endpoint); the portal builds HTML, and its inputs — a scanned SSID, the
 // submitted WiFi name — are attacker-controllable during provisioning (the
@@ -791,8 +802,13 @@ void setup() {
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
-  web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/addblock", []() {
+    if (!requireAuth()) return;
+    String d = normDom(web.arg("d"));
+    if (hasCtl(d.c_str())) { web.send(400, "text/plain", "domain has control characters"); return; }
+    addCustom(d); web.send(200, "text/plain", "ok");
+  });
+  web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(normDom(web.arg("d"))); web.send(200, "text/plain", "ok"); });
   web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
     if (!requireAuth()) return;
     long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
@@ -822,7 +838,9 @@ void setup() {
   web.on("/fetchnow", []() { if (!requireAuth()) return; fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
   web.on("/setupdate", []() {
     if (!requireAuth()) return;
-    if (web.hasArg("u")) updateUrl = web.arg("u");
+    String u = web.arg("u"); u.trim();
+    if (hasCtl(u.c_str())) { web.send(400, "text/plain", "URL has control characters"); return; }
+    if (web.hasArg("u")) updateUrl = u;
     if (web.hasArg("h")) updateIntervalH = constrain(web.arg("h").toInt(), 1, 168);
     setClockTz();
     if (web.hasArg("d")) updateDays = constrain(web.arg("d").toInt(), 0, 127);
