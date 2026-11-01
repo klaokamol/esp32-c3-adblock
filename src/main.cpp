@@ -27,7 +27,11 @@
 #ifndef UPSTREAM_PORT
 #define UPSTREAM_PORT 53
 #endif
+#ifndef UPSTREAM2_IP
+#define UPSTREAM2_IP 149, 112, 112, 112
+#endif
 static const IPAddress UPSTREAM(UPSTREAM_IP);
+static const IPAddress UPSTREAM2(UPSTREAM2_IP);
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
@@ -244,6 +248,7 @@ static int buildBlocked(int qend, uint16_t qtype) {
 // to the next client (every answer shifted by one). Now: drain stale datagrams first,
 // send with a fresh random txid, and only accept a reply whose txid, question section,
 // and source address/port match. The client's own txid is restored on the way back.
+static uint8_t upPref = 0;
 static int forwardUpstream(int qlen, int qend) {
   upstreamCli.flush();                                   // release any half-read buffer
   while (upstreamCli.parsePacket() > 0) upstreamCli.flush();   // drop stale late replies
@@ -253,19 +258,28 @@ static int forwardUpstream(int qlen, int qend) {
   const bool haveQ = ql > 0 && ql <= (int)sizeof(q) && qend <= qlen;
   if (haveQ) memcpy(q, buf + 12, ql);
   buf[0] = wid >> 8; buf[1] = wid & 0xFF;
-  upstreamCli.beginPacket(UPSTREAM, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
-  const uint32_t t0 = millis();
-  while (millis() - t0 < 1000) {                         // deadline, not a retry count
-    int sz = upstreamCli.parsePacket();
-    if (sz <= 0) { delay(1); continue; }
-    const bool fromUp = upstreamCli.remoteIP() == UPSTREAM && upstreamCli.remotePort() == UPSTREAM_PORT;
-    int n = upstreamCli.read(buf, sizeof(buf));
-    upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
-    if (!fromUp || n < 12 || sz > (int)sizeof(buf)) continue;
-    if (buf[0] != (wid >> 8) || buf[1] != (wid & 0xFF)) continue;
-    if (haveQ && (n < 12 + ql || memcmp(buf + 12, q, ql) != 0)) continue;
-    buf[0] = cid0; buf[1] = cid1;
-    return n;
+  static uint8_t sent[512];
+  const int tries = qlen <= (int)sizeof(sent) ? 2 : 1;
+  if (tries == 2) memcpy(sent, buf, qlen);
+  for (int a = 0; a < tries; a++) {
+    const uint8_t s = upPref ^ a;
+    const IPAddress up = s ? UPSTREAM2 : UPSTREAM;
+    if (a) memcpy(buf, sent, qlen);
+    upstreamCli.beginPacket(up, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
+    const uint32_t t0 = millis();
+    while (millis() - t0 < 500) {                       // deadline, not a retry count
+      int sz = upstreamCli.parsePacket();
+      if (sz <= 0) { delay(1); continue; }
+      const bool fromUp = upstreamCli.remoteIP() == up && upstreamCli.remotePort() == UPSTREAM_PORT;
+      int n = upstreamCli.read(buf, sizeof(buf));
+      upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
+      if (!fromUp || n < 12 || sz > (int)sizeof(buf)) continue;
+      if (buf[0] != (wid >> 8) || buf[1] != (wid & 0xFF)) continue;
+      if (haveQ && (n < 12 + ql || memcmp(buf + 12, q, ql) != 0)) continue;
+      buf[0] = cid0; buf[1] = cid1;
+      upPref = s;
+      return n;
+    }
   }
   return 0;
 }
@@ -278,6 +292,7 @@ static bool handleDns() {
     did = true;
     IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
     int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
+    if ((buf[2] & 0xF8) != 0 || ((buf[4] << 8) | buf[5]) != 1) continue;
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
     Dev* c = getClient((uint32_t)cip);
@@ -317,6 +332,8 @@ static String htmlEscape(const String& s) {
 
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
 #include "board_ui.h"
+#include "hashlist.h"
+static_assert(HASH_BYTES == 5, "hashlist.h assumes 5-byte hashes");
 
 static void handleStats() {
   uint32_t up = millis() / 1000;
@@ -371,17 +388,32 @@ static void reopenBlocklist() {
   numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
   buildFlashIndex();
 }
-static void beginBlocklistSwap() {
+static const size_t SWAP_SLACK = 16 * 4096;
+static void beginBlocklistSwap(int incoming) {
+  LittleFS.remove("/blocklist.new");
+  if (incoming > 0 && LittleFS.totalBytes() - LittleFS.usedBytes() >= (size_t)incoming + SWAP_SLACK) return;
   if (blocklist) blocklist.close();
   numHashes = 0;
   LittleFS.remove(BLOCKLIST_PATH);
-  LittleFS.remove("/blocklist.new");
+}
+static bool blobSorted(File& f) {
+  uint64_t prev = 0; int n;
+  while ((n = f.read(rangeBuf, sizeof(rangeBuf))) > 0) if (!hashesAscending(rangeBuf, n, &prev)) return false;
+  return true;
+}
+static bool landed(size_t n) {
+  File f = LittleFS.open("/blocklist.new", "r");
+  size_t sz = f ? f.size() : 0;
+  if (f) f.close();
+  return sz == n;
 }
 static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
   File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
+  size_t sz = f ? f.size() : 0;
   bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
+  ok = ok && blobSorted(f);
+  if (f) f.close();
+  if (ok) { if (blocklist) blocklist.close(); LittleFS.remove(BLOCKLIST_PATH); LittleFS.rename("/blocklist.new", BLOCKLIST_PATH); }
   else    LittleFS.remove("/blocklist.new");
   reopenBlocklist();
   return ok;
@@ -389,12 +421,14 @@ static bool commitNewBlocklist() {                  // /blocklist.new -> live (v
 
 // ---------- OTA blocklist update (browser upload) ----------
 static bool upOk = false;
+static bool upFull = false;
 static bool upAuthOk = false;
 static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+           upOk ? "ok" : upFull ? "rejected: blocklist does not fit the filesystem"
+                       : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -402,7 +436,7 @@ static void handleUpload() {
     case UPLOAD_FILE_START:
       upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
-      upOk = false; beginBlocklistSwap();
+      upOk = false; upFull = false; beginBlocklistSwap(web.clientContentLength());
       upFile = LittleFS.open("/blocklist.new", "w");
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
@@ -412,6 +446,8 @@ static void handleUpload() {
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
+      upFull = !landed(u.totalSize);
+      if (upFull) LittleFS.remove("/blocklist.new");
       upOk = commitNewBlocklist();
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
       break;
@@ -447,20 +483,23 @@ static bool fetchBlocklist(String url) {
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) { updateStatus = "HTTP " + String(code) + " " + HTTPClient::errorToString(code) + ", heap " + String(ESP.getFreeHeap() / 1024) + "K"; http.end(); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
-  beginBlocklistSwap();
+  int len = http.getSize();
+  beginBlocklistSwap(len);
   File f = LittleFS.open("/blocklist.new", "w");
   if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
   WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  uint8_t b[1024]; size_t total = 0; uint32_t idle = millis(); bool stalled = false, full = false;
   while (http.connected() && (len < 0 || (int)total < len)) {
+    bool dns = handleDns();
     size_t avail = stream->available();
-    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
-    else { if (millis() - idle > 15000) break; delay(2); }
+    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { if (f.write(b, n) != (size_t)n) { full = true; break; } total += n; idle = millis(); } }
+    else { if (millis() - idle > 15000) { stalled = true; break; } if (!dns) delay(2); }
   }
   f.close(); http.end();
-  if (len > 0 && total != (size_t)len) {
+  full = full || !landed(total);
+  if (stalled || full || (len > 0 && total != (size_t)len)) {
     LittleFS.remove("/blocklist.new"); reopenBlocklist();
-    updateStatus = "truncated (" + String(total) + "/" + String(len) + "B)";
+    updateStatus = (full ? "fs full (" : "truncated (") + String(total) + "/" + String(len) + "B)";
     Serial.printf("[remote] %s\n", updateStatus.c_str());
     return false;
   }
@@ -515,7 +554,7 @@ static bool connectWiFi() {
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
-  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, pass);
+  WiFi.mode(WIFI_STA); WiFi.setSleep(WIFI_PS_MIN_MODEM); WiFi.begin(ssid, pass);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
   Serial.println();
@@ -651,7 +690,7 @@ void loop() {
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
     if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
-    else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
+    else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; if (!fetchBlocklist(updateUrl) && numHashes == 0) lastCheckMs -= updateIntervalH * 3600000UL - 600000UL; }
   }
   if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
 }
