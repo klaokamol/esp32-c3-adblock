@@ -22,6 +22,7 @@
 #include "pending.h"
 #include "banlist.h"
 #include "input.h"
+#include "settings.h"
 #include "esp_private/wifi.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
@@ -69,12 +70,15 @@ String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0
 
 static BanList bans;
 
+static const char* SETTINGS_PATH = "/settings.cfg";
+static long cfg[S_COUNT];
+
 // remote blocklist auto-update
 String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
-uint32_t updateIntervalH = 24;      // hours between auto-fetches
+long&    updateIntervalH = cfg[S_UPIV]; // hours between auto-fetches
 uint32_t lastCheckMs = 0;
-uint8_t  updateDays = 0;            // bit0 Sun..bit6 Sat; 0 = use updateIntervalH instead
-uint8_t  updateHour = 3;
+long&    updateDays = cfg[S_UPDAYS]; // bit0 Sun..bit6 Sat; 0 = use updateIntervalH instead
+long&    updateHour = cfg[S_UPHOUR];
 int      lastSchedDay = -1;
 String updateStatus = "Never";
 
@@ -86,9 +90,9 @@ String      portalOpts;             // <option> list of scanned networks, built 
 // blocking pause (Pi-hole-style "disable for a while")
 bool     blockingOn = true;
 uint32_t resumeAt   = 0;            // millis() to auto-resume; 0 = paused indefinitely / not paused
-uint8_t  nightMode  = 0;
-uint8_t  nightFrom  = 22, nightTo = 7;
-int8_t   clockTz    = 7;            // hours from UTC
+long&    nightMode  = cfg[S_NMODE];
+long&    nightFrom  = cfg[S_NFROM], &nightTo = cfg[S_NTO];
+long&    clockTz    = cfg[S_TZ];   // hours from UTC
 
 // ---------- hashing / matching ----------
 static uint64_t fnv40(const char* s, size_t n) {
@@ -431,7 +435,8 @@ static_assert(HASH_BYTES == 5, "hashlist.h assumes 5-byte hashes");
 static bool nowLocal(int& day, int& dow, int& hour) { return splitLocal(time(nullptr), clockTz, day, dow, hour); }
 static int localHour() { int d, w, h; return nowLocal(d, w, h) ? h : -1; }
 // ponytail: whole-hour zones and no DST rules; +5:30 rounds to +6, store minutes and a POSIX TZ string if that matters
-static void setClockTz() { if (web.hasArg("tz")) clockTz = constrain(web.arg("tz").toInt(), -12, 14); }
+static void argCfg(const char* name, int i) { if (web.hasArg(name)) cfg[i] = settingClamp(i, web.arg(name).toInt()); }
+static void setClockTz() { argCfg("tz", S_TZ); }
 static String grouped(uint32_t n) { String s(n); for (int i = s.length() - 3; i > 0; i -= 3) s = s.substring(0, i) + "," + s.substring(i); return s; }
 static String clockStamp() {
   if (localHour() < 0) return "";
@@ -578,30 +583,23 @@ static void handleUpload() {
 }
 
 // ---------- remote blocklist auto-update ----------
-static int cfgInt(File& f, int def) { String s = f.readStringUntil('\n'); s.trim(); return s.length() ? s.toInt() : def; }
-static void loadUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
-  updateUrl = f.readStringUntil('\n'); updateUrl.trim();
-  updateIntervalH = constrain(cfgInt(f, updateIntervalH), 1, 168);
-  updateDays = constrain(cfgInt(f, updateDays), 0, 127);
-  updateHour = constrain(cfgInt(f, updateHour), 0, 23);
+static void loadSettings() {
+  settingsDefaults(cfg);
+  LittleFS.remove("/update.cfg"); LittleFS.remove("/ui.cfg");
+  File f = LittleFS.open(SETTINGS_PATH, "r"); if (!f) return;
+  while (f.available()) {
+    String l = f.readStringUntil('\n'); l.trim();
+    if (l.startsWith("url=")) { updateUrl = l.substring(4); if (hasCtl(updateUrl.c_str())) updateUrl = ""; }
+    else settingParse(l.c_str(), cfg);
+  }
   f.close();
 }
-static void saveUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
-  f.println(updateUrl); f.println(updateIntervalH); f.println(updateDays); f.println(updateHour); f.close();
-}
-static void loadUiCfg() {
-  File f = LittleFS.open("/ui.cfg", "r"); if (!f) return;
-  nightMode = constrain(cfgInt(f, nightMode), 0, 2);
-  nightFrom = constrain(cfgInt(f, nightFrom), 0, 23);
-  nightTo = constrain(cfgInt(f, nightTo), 0, 23);
-  clockTz = constrain(cfgInt(f, clockTz), -12, 14);
+static void saveSettings() {
+  File f = LittleFS.open(SETTINGS_PATH, "w"); if (!f) return;
+  f.print("url="); f.println(updateUrl);
+  char b[32];
+  for (int i = 0; i < S_COUNT; i++) { settingFormat(i, cfg[i], b, sizeof b); f.println(b); }
   f.close();
-}
-static void saveUiCfg() {
-  File f = LittleFS.open("/ui.cfg", "w"); if (!f) return;
-  f.println(nightMode); f.println(nightFrom); f.println(nightTo); f.println(clockTz); f.close();
 }
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "No URL set"; return false; }
@@ -770,8 +768,7 @@ void setup() {
     Serial.printf("blocklist: %u domains\n", numHashes);
     buildFlashIndex();
   }
-  loadCustom(); loadBanned(); loadUpdateCfg();
-  loadUiCfg();
+  loadCustom(); loadBanned(); loadSettings();
   Serial.printf("custom: %d, banned: %d\n", numCustom, bans.n);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
@@ -823,11 +820,9 @@ void setup() {
   });
   web.on("/night", []() {
     if (!requireAuth()) return;
-    if (web.hasArg("m")) nightMode = constrain(web.arg("m").toInt(), 0, 2);
-    if (web.hasArg("from")) nightFrom = constrain(web.arg("from").toInt(), 0, 23);
-    if (web.hasArg("to")) nightTo = constrain(web.arg("to").toInt(), 0, 23);
+    argCfg("m", S_NMODE); argCfg("from", S_NFROM); argCfg("to", S_NTO);
     setClockTz();
-    if (web.args()) saveUiCfg();
+    if (web.args()) saveSettings();
     web.send(200, "text/plain", String(nightMode) + " " + nightFrom + "-" + nightTo + " tz" + clockTz + (localHour() < 0 ? " nosync" : ""));
   });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
@@ -841,11 +836,10 @@ void setup() {
     String u = web.arg("u"); u.trim();
     if (hasCtl(u.c_str())) { web.send(400, "text/plain", "URL has control characters"); return; }
     if (web.hasArg("u")) updateUrl = u;
-    if (web.hasArg("h")) updateIntervalH = constrain(web.arg("h").toInt(), 1, 168);
+    argCfg("h", S_UPIV);
     setClockTz();
-    if (web.hasArg("d")) updateDays = constrain(web.arg("d").toInt(), 0, 127);
-    if (web.hasArg("hr")) updateHour = constrain(web.arg("hr").toInt(), 0, 23);
-    saveUiCfg(); saveUpdateCfg(); web.send(200, "text/plain", "ok");
+    argCfg("d", S_UPDAYS); argCfg("hr", S_UPHOUR);
+    saveSettings(); web.send(200, "text/plain", "ok");
   });
   web.begin();
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
