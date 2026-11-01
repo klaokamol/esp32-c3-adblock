@@ -2,99 +2,102 @@
 // Dashboard HTML for the C3 AdBlocker web UI, kept in its own header so the
 // Arduino IDE preprocessor doesn't choke on the inlined markup (issue #6).
 
-const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>C3 AdBlock</title><style>
-body{font:14px system-ui,sans-serif;margin:0;background:#0d1117;color:#c9d1d9}
-header{background:#161b22;padding:14px 18px;border-bottom:1px solid #30363d}
-h1{margin:0;font-size:18px}h1 span{color:#3fb950}.wrap{padding:16px;max-width:1000px;margin:auto}
-.cards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;flex:1;min-width:120px}
-.card .v{font-size:22px;font-weight:600}.card .l{color:#8b949e;font-size:12px}
-table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;margin-bottom:18px}
-th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #21262d;font-size:13px}
-th{background:#21262d;color:#8b949e}tr:hover td{background:#1c2128}
-.b{color:#f85149}.a{color:#3fb950}.tag{background:#30363d;border-radius:4px;padding:1px 6px;font-size:11px}
-button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:4px 9px;cursor:pointer}
-button:hover{background:#30363d}.ban{color:#f85149}input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:6px}
-h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
-</style></head><body>
-<header><h1>🛡️ C3 AdBlock <span id=host></span></h1></header><div class=wrap>
-<div id=credwarn style="display:none;background:#3b1d1d;border:1px solid #f85149;color:#ffb3ae;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px">
-⚠️ <b>Default credentials in use.</b> WEB_PASS/OTA_PASS in <code>secrets.h</code> are still the placeholder values — anyone can read them in the public repo. Set real values and reflash.
-</div>
-<div id=blockbar style="display:flex;align-items:center;gap:12px;margin-bottom:14px;padding:12px 14px;background:#161b22;border:1px solid #30363d;border-radius:8px">
-<span id=blockdot style=font-size:20px>🛡️</span><b id=blockstate style=flex:1 data-on=1>Blocking active</b>
-<select id=pausedur style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:5px"><option value=30>30s</option><option value=300 selected>5 min</option><option value=1800>30 min</option><option value=0>until I re-enable</option></select>
-<button id=pausebtn onclick=togglePause()>Pause</button></div>
-<div class=cards id=sys></div>
-<h2>CLIENTS</h2><table id=ct><thead><tr><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table>
-<h2>CUSTOM BLOCKED DOMAINS</h2>
-<div style=margin-bottom:8px><input id=dom placeholder="ads.example.com" size=30><button onclick=addDom()>Block domain</button></div>
-<table id=cl><tbody></tbody></table>
-<h2>BLOCKLIST &mdash; UPLOAD</h2>
-<form id=upf style=margin-bottom:6px><input type=file id=blf accept=.bin><button>Upload blocklist</button> <span id=upmsg style=color:#8b949e></span></form>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">build <code>blocklist.bin</code> with <code>tools/build_blocklist.py</code>, then upload here &mdash; no USB</div>
-<h2>BLOCKLIST &mdash; REMOTE AUTO-UPDATE</h2>
-<div id=ubox style=margin-bottom:6px><input id=uurl placeholder="https://host/blocklist.bin" size=40> every <input id=uiv size=2 value=24>h
-<div style=margin:6px>or on <label><input type=checkbox class=ud value=1>Mon</label> <label><input type=checkbox class=ud value=2>Tue</label> <label><input type=checkbox class=ud value=3>Wed</label> <label><input type=checkbox class=ud value=4>Thu</label> <label><input type=checkbox class=ud value=5>Fri</label> <label><input type=checkbox class=ud value=6>Sat</label> <label><input type=checkbox class=ud value=0>Sun</label> at <input id=uhr size=2>:00 (uses the UTC offset from night mode; no day ticked = every N h)</div>
-<button onclick=saveUpd()>Save</button> <button onclick=fetchNow()>Fetch now</button></div>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule (e.g. a GitHub release asset). last: <span id=ustat>&mdash;</span></div>
-<h2>FIRMWARE &mdash; OTA UPDATE</h2>
-<form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
-<h2>STATUS LED &mdash; NIGHT MODE</h2>
-<div id=nbox style=margin-bottom:6px><select id=nmode style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:5px"><option value=0>Day (LED blinks)</option><option value=1>Night (LED quiet)</option><option value=2>Auto (follow schedule)</option></select>
-quiet from <input id=nfrom size=2> &ndash; <input id=nto size=2> h, UTC+<input id=ntz size=2>
-<button onclick=saveNight()>Save</button> <span id=nmsg style=color:#8b949e></span></div>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">hides only the idle heartbeat; paused and no-WiFi states stay visible. auto needs NTP, clock: <span id=nclk>&mdash;</span></div>
-<h2>WIFI</h2>
-<div style=margin-bottom:18px><button onclick="if(confirm('Forget saved WiFi and reboot into the setup portal?'))forgetWifi()">Forget WiFi</button></div>
-</div><script>
-function fmt(n){return n.toLocaleString()}
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 // A plain <img>/<form> CSRF can't set a custom header, only same-origin fetch()
 // can — so requiring this on every mutating request blocks drive-by CSRF even
 // though the server can't otherwise tell a forged request from a real one over
 // plain HTTP Basic Auth (browsers auto-replay cached Basic Auth cross-origin).
-const CSRF_HDRS={'X-Requested-With':'c3-adblock'}
-function togglePause(){fetch(blockstate.dataset.on=='1'?'/pause?s='+pausedur.value:'/resume',{headers:CSRF_HDRS}).then(load);}
-async function load(){let s=await(await fetch('/stats.json')).json();
+const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>C3 AdBlock</title><style>:root{--u:48px;--bg:#0a0a0f;--p:#12121a;--l:#4a4a6a;--t:#e8e8ee;--m:#9696b0;--b:#fcee0a;--c:#00f0ff;--gr:#00ff9c;--o:#ff8a00;--r:#ff2a55;--ra:#1d1d2a;--w:#2a0a14;color-scheme:dark;scrollbar-color:var(--l) var(--bg);--mo:ui-monospace,Menlo,Consolas,monospace}*{box-sizing:border-box;-webkit-tap-highlight-color:#fcee0a40}body{font:14px/1.45 var(--mo);margin:0;background:var(--bg);color:var(--t)}header{position:sticky;top:0;z-index:5;height:56px;display:flex;align-items:center;gap:14px;padding:0 max(20px,calc((100% - 1240px)/2));background:var(--p);border-bottom:1px solid var(--h,var(--c))}.state{flex:1;min-width:0;display:flex;align-items:center;gap:10px;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ctl{display:flex;gap:8px}h1{margin:0;font-size:12px}h1 span{color:var(--c);font-weight:400;letter-spacing:0;text-transform:none;margin-left:6px}.wrap{padding:20px;max-width:1280px;margin:auto}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px}.sysline{color:var(--m);font-size:13px;margin:0 0 22px}.card{display:flex;flex-direction:column;justify-content:center;height:calc(var(--u)*2);padding:0 14px;min-width:0}.card .v{white-space:nowrap;font:600 20px var(--mo);font-variant-numeric:tabular-nums;text-shadow:0 0 10px currentColor}.card .l,h2,.acc h3,.row>label,th{color:var(--m);font-size:11px}h1,.state,button,.day span,summary,.card .l,h2,h3,.row>label,th{letter-spacing:.08em;text-transform:uppercase;font-weight:700}.bl{color:var(--b)}table{width:100%;border-collapse:separate;border-spacing:0}th,td{padding:0 12px;text-align:left;border-bottom:1px solid var(--l)}td{font-size:13px}tr:last-child td{border-bottom:0}#ct tr,#cl tr{height:var(--u)}.dl{margin:0 -16px -16px;max-height:calc(var(--u)*3 + 1px);overflow-y:auto}#cl tr:first-child td,.ac~.sub,.sub+.sub{border-top:1px solid var(--l)}#cl td:first-child{padding-left:16px}#ct tr>:nth-child(n+3){text-align:right}.b{color:var(--r)}.a{color:var(--gr)}.tag{border:1px solid var(--r);color:var(--r);border-radius:2px;padding:0 6px;font-size:11px;margin-left:6px}button{color:var(--t);padding:0 14px;height:36px;cursor:pointer;font:inherit;font-size:12px}button:active{transform:translateY(1px)}button.primary{--e:var(--b);--f:var(--b);color:var(--bg);font-weight:600}.ban,.rmbtn{padding:0 10px;font-size:11px}#cl td:last-child{padding-right:16px}.ban{min-width:60px;color:var(--r)}.ban.un{color:var(--gr)}.danger{color:var(--r)}input,select{accent-color:var(--b);background:var(--bg);border:1px solid var(--l);color:var(--t);border-radius:2px;padding:0 10px;height:36px;font:inherit;font-size:14px}input[type=file]{padding:0 4px 0 0;min-width:0;flex:1 1 180px;color:var(--m);font-size:13px;line-height:34px;overflow:hidden}input[type=file]::file-selector-button{height:34px;margin:0 10px 0 0;padding:0 8px;border:0;border-right:1px solid var(--l);background:var(--ra);color:var(--t);font:inherit;font-size:12px;cursor:pointer}.acc button:not(.ban):not(.rmbtn){min-width:min(112px,30vw)}button:focus-visible,.day input:focus-visible+span,summary:focus-visible{outline:2px solid var(--c);outline-offset:-3px}body::after{content:"";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(to bottom,#00f0ff09 0 1px,transparent 1px 3px)}::selection{background:var(--b);color:var(--bg)}.ac,.sub>.row{margin-bottom:0}.row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin-bottom:14px;min-height:36px}.row>label{flex:none;width:100%}.ac~.sub,.sub+.sub{margin:18px -16px 0;padding:14px 16px 0}.row>.grow{flex:1;min-width:0}.days{display:flex;gap:6px;flex:1;min-width:0}.day{flex:1}.day input{position:absolute;opacity:0;width:0;height:0}.day span{display:inline-flex;align-items:center;justify-content:center;min-width:0;width:100%;height:36px;cursor:pointer;color:var(--m);font-size:12px;font-weight:400;user-select:none}.day input:checked+span{--e:var(--b);--f:#2b2a0e;text-shadow:0 0 8px var(--b);color:var(--b);font-weight:700}.hint{color:var(--m);font-size:12px;margin:0 0 4px}.hint code{font:inherit;color:var(--c)}.dot{width:14px;height:14px;border-radius:50%;border:1.5px solid var(--gr);flex:none;position:relative;box-shadow:0 0 8px var(--gr)}.dot::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--gr)}.off .dot{border-color:var(--o);box-shadow:0 0 8px var(--o)}.off .dot::after,.off #pausedur{display:none}header.off{--h:var(--o)}#err,#credwarn{--e:var(--r);--f:var(--w);padding:10px 14px;margin-bottom:14px;font-size:13px}#credwarn code{font-size:13px;color:var(--o)}[hidden]{display:none!important}.none{color:var(--m);text-align:center}@media(min-width:761px){.set{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;align-items:start}.dl{height:calc(var(--u)*7);max-height:none;scrollbar-width:none}.none{height:calc(var(--u)*7)}}.acc{margin-bottom:10px}.acc>summary{list-style:none;cursor:pointer;display:flex;justify-content:space-between;align-items:center;min-height:var(--u);padding:0 16px;font-size:12px}.acc>summary::-webkit-details-marker{display:none}.acc>summary::after{content:"+";color:var(--m);font:600 20px var(--mo)}.acc[open]>summary::after{content:"\2013"}.acc>.body{padding:0 16px 16px}.acc .hint{margin-bottom:8px}.acc h3{margin:4px 0 8px}.row .hint{margin:0}.hint:empty{display:none}.body>p:last-child{margin:0}@media(pointer:coarse){:root{--u:56px}button,select,input{min-height:44px}.day span{height:44px}}.sec{margin:22px 0 10px;display:flex;align-items:center;gap:10px}.sec::after{content:"";flex:1;height:1px;background:var(--l)}input[type=time]{width:120px}.addrow input{flex:1;min-width:0}@media(max-width:600px){#pausedur{max-width:92px;padding:0 6px}h1{display:none}header{padding-left:12px;padding-right:12px}.card{padding:0 10px}.card .v{font-size:17px}.card .l{font-size:10px;letter-spacing:.03em}.state{white-space:normal;line-height:1.2}input[type=file]{flex-basis:100%}}@media(max-width:760px){.set{display:flex;flex-direction:column}.set>div{display:contents}#ubox{order:1}#nbox{order:2}#device{order:3}.days{gap:4px}.day span{font-size:11px}.wrap{padding:12px}#ct tr>:nth-child(2){display:none}#ct th,#ct td{padding:0 6px}td{font-size:12px}#ct tr>:first-child{padding-left:10px}#ct tr>:last-child{padding-right:10px}.ban{min-width:52px}}@media(max-width:400px){#ct th,#ct td{padding:0 4px;letter-spacing:0}.ban{padding:0 6px}}.card,.acc,.tw,#err,#credwarn,button,.day span{--e:var(--l);clip-path:polygon(0 0,calc(100% - var(--k)) 0,100% var(--k),100% 100%,var(--k) 100%,0 calc(100% - var(--k)));--f:var(--p);border:1px solid transparent;position:relative;isolation:isolate;background:var(--e)}:is(.card,.acc,.tw,#err,#credwarn,button,.day span)::before{content:"";position:absolute;inset:0;z-index:-1;background:var(--f);clip-path:inherit}.card,.acc,.tw,#err,#credwarn{--k:12px}button,.day span{--k:7px}.card,.acc,.tw{--e:#3a6f80}.card::before,.acc::before,.tw::before{box-shadow:inset 0 0 14px #00f0ff14}.tw{margin-bottom:22px}button.primary::before{box-shadow:inset 0 0 10px #ffffff59}.day input:checked+span::before{box-shadow:inset 0 0 10px #fcee0a40}.state b{text-shadow:0 0 8px var(--h,var(--gr))}@media(hover:hover){tr:hover td{background:var(--ra)}button:hover{--e:var(--b);color:var(--b)}button.primary:hover{color:var(--bg)}button.primary:hover::before{box-shadow:inset 0 0 14px #fff}.day:hover span{--e:var(--b);color:var(--b)}input:hover,select:hover{border-color:var(--b)}input[type=file]::file-selector-button:hover{color:var(--b)}.danger:hover,.ban:hover{--e:var(--r);color:var(--r)}.un:hover{--e:var(--gr);color:var(--gr)}.acc>summary:hover{color:var(--b)}}input:focus,select:focus{outline:0;border-color:var(--c)}header{box-shadow:0 2px 10px -4px var(--h,var(--c))}#err{position:sticky;top:56px;z-index:4}
+</style></head><body>
+<header id=hdr><h1>C3 AdBlock<span id=host></span></h1>
+<span class=state><span id=blockdot class=dot></span><b id=blockstate data-on=1>Blocking active</b></span>
+<span class=ctl><select id=pausedur><option value=30>30s</option><option value=300 selected>5 min</option><option value=1800>30 min</option><option value=0>until I re-enable</option></select>
+<button id=pausebtn class=primary onclick=togglePause()>Pause</button></span></header>
+<div class=wrap>
+<div id=credwarn hidden>Default passwords. Set <code>WEB_PASS</code> and <code>OTA_PASS</code> in <code>secrets.h</code>, then reflash.</div>
+<div id=err hidden></div>
+<div class=cards id=sys></div><p class=sysline id=sysline></p>
+<h2 class=sec id=clients>Clients</h2><div class=tw><table id=ct><thead><tr><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table></div>
+<div class=set><div><details class=acc id=ubox><summary>Blocklist</summary><div class=body>
+<p class=hint>Fetch <code>blocklist.bin</code> from a URL on a schedule.</p>
+<div class=row><label>URL</label><input id=uurl class=grow placeholder="https://host/blocklist.bin"></div>
+<div class=row><label>Schedule</label><div class=days id=ums></div></div>
+<div class=row id=uh><label>Every</label><input id=uiv type=number min=1 max=168 value=24 style=width:88px> <span class=hint>hours</span></div>
+<div id=ud hidden><div class=row><label>Days</label><div class=days id=uds></div></div>
+<div class=row><label>Time</label><input id=uhr type=time step=3600></div></div>
+<div class="row ac"><button class=primary onclick=saveUpd()>Save</button><button onclick=fetchNow()>Fetch now</button></div>
+<p class=hint>Last fetch: <span id=ustat>&mdash;</span></p>
+<div class=sub><h3>Or upload a file</h3><p class=hint>Built with <code>tools/build_blocklist.py</code>.</p>
+<form id=upf class=row><input type=file id=blf accept=.bin><button>Upload</button><span id=upmsg class=hint></span></form></div>
+</div></details>
+<details class=acc id=nbox><summary>Status LED</summary><div class=body>
+<div class=row><label>Mode</label><div class=days id=nms></div></div>
+<div class=row id=nq hidden><label>Quiet hours</label><input id=nfrom type=time step=3600> <span class=hint>to</span> <input id=nto type=time step=3600></div>
+<p class=hint>Quiet hours mute only the idle blink; paused and no-Wi-Fi still show. Time zone <span id=ntzl></span> (this browser). Device clock: <span id=nclk>&mdash;</span> <span id=nmsg></span></p>
+</div></details>
+</div><div><details class=acc><summary>Extra blocked domains</summary><div class=body>
+<p class=hint>Blocked in addition to the blocklist.</p>
+<div class="row addrow"><input id=dom placeholder="ads.example.com"><button class=primary onclick=addDom()>Block domain</button></div>
+<div class=dl><table id=cl><tbody></tbody></table></div></div></details>
+<details class=acc id=device><summary>Firmware &amp; Wi-Fi</summary><div class=body>
+<div class=sub><h3>Update firmware</h3><p class=hint>Upload <code>firmware.bin</code>. It is verified, then the device reboots.</p>
+<form id=fwf class=row><input type=file id=fwb accept=.bin><button>Flash</button><span id=fwmsg class=hint></span></form></div>
+<div class=sub><h3>Forget Wi-Fi</h3><p class=hint>Reboot into Wi-Fi setup.</p>
+<div class=row><button class=danger onclick="if(confirm('Forget Wi-Fi and reboot into setup?'))forgetWifi()">Forget Wi-Fi</button></div></div>
+</div></details>
+</div></div>
+</div><script>
+function fmt(n){return n.toLocaleString()}
+const esc=s=>String(s).replace(/[&<>"']/g,c=>'&#'+c.charCodeAt()+';')
+const H={'X-Requested-With':'c3-adblock'}
+const RB='✓ rebooting, reconnect in ~15s'
+const F=u=>fetch(u,{headers:H})
+function act(u){return F(u).then(r=>{if(!r.ok)throw r.status;err.hidden=1;load()}).catch(e=>{err.textContent='Request failed ('+(e.message||e)+'). Check connection and password.';err.hidden=0})}
+function togglePause(){act(blockstate.dataset.on=='1'?'/pause?s='+pausedur.value:'/resume')}
+async function load(){let s=await(await fetch('/stats.json')).json(),A=document.activeElement;
 host.textContent='@ '+s.ip;
-credwarn.style.display=s.defcreds?'block':'none';
+credwarn.hidden=!s.defcreds;
 let on=s.blocking!==false;blockstate.dataset.on=on?'1':'0';
-blockdot.textContent=on?'🛡️':'⏸️';blockbar.style.borderColor=on?'#30363d':'#f0883e';
+hdr.className=on?'':'off';
 blockstate.textContent=on?'Blocking active':(s.resumeIn>0?'Paused — resumes in '+s.resumeIn+'s':'Paused');
-pausebtn.textContent=on?'Pause':'Resume';pausedur.style.display=on?'':'none';
-sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
+pausebtn.textContent=on?'Pause':'Resume';
+sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['In blocklist',fmt(s.domains),'bl']
+]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
+sysline.textContent='WiFi '+s.rssi+' dBm · '+s.temp+' °C · '+Math.round(s.heap/1024)+' KB free · up '+s.uptime;
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
+`<tr><td>${c.ip}${c.banned?' <span class=tag>BANNED</span>':''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
-if(document.activeElement!=uurl)uurl.value=s.upurl||'';
-if(document.activeElement!=uiv)uiv.value=s.upiv||24;
-if(!ubox.contains(document.activeElement)){document.querySelectorAll('.ud').forEach(c=>c.checked=(s.updays>>c.value&1)==1);uhr.value=s.uphour;}
+<td><button class="ban ${c.banned?'un':''}" data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button class=rmbtn data-d="${esc(d)}">remove</button></td></tr>`).join('')||'<tr><td class=none>none yet</td></tr>';
+if(A!=uurl)uurl.value=s.upurl||'';
+if(A!=uiv)uiv.value=s.upiv||24;
+if(!ubox.contains(A)){QA('.ud').forEach(c=>c.checked=(s.updays>>c.value&1)==1);uhr.value=hh(s.uphour);Q('input[name=um][value='+(s.updays?'d':'h')+']').checked=true;showUm();}
 ustat.textContent=s.upstat||'—';
-if(!nbox.contains(document.activeElement)){nmode.value=s.nmode;nfrom.value=s.nfrom;nto.value=s.nto;ntz.value=s.ntz;}
+if(!nbox.contains(A)){Q('input[name=nm][value="'+s.nmode+'"]').checked=true;nfrom.value=hh(s.nfrom);nto.value=hh(s.nto);showNm();}
+ntzl.textContent='UTC'+(TZ>=0?'+':'')+TZ;if(s.ntz!==TZ&&!tzSent){tzSent=1;F('/night?tz='+TZ)}
 nclk.textContent=s.nhour<0?'not synced':s.nhour+':00 local';}
-function saveNight(){fetch('/night?m='+nmode.value+'&from='+(parseInt(nfrom.value)||0)+'&to='+(parseInt(nto.value)||0)+'&tz='+(parseInt(ntz.value)||0),{headers:CSRF_HDRS}).then(()=>{nmsg.textContent='saved';setTimeout(()=>nmsg.textContent='',1500);load()})}
-function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:CSRF_HDRS}).then(()=>{dom.value='';load()})}}
-ct.addEventListener('click',e=>{if(e.target.classList.contains('ban'))fetch('/ban?ip='+e.target.dataset.ip,{headers:CSRF_HDRS}).then(load)});
-cl.addEventListener('click',e=>{if(e.target.classList.contains('rmbtn'))fetch('/unblock?d='+encodeURIComponent(e.target.dataset.d),{headers:CSRF_HDRS}).then(load)});
-function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24)+'&d='+[...document.querySelectorAll('.ud')].reduce((m,c)=>m|(c.checked?1<<c.value:0),0)+'&hr='+(parseInt(uhr.value)||0),{headers:CSRF_HDRS}).then(load)}
-function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
-function forgetWifi(){fetch('/forgetwifi',{headers:CSRF_HDRS}).then(r=>r.text()).then(t=>alert(t))}
-fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
-let fd=new FormData();fd.append('f',f);
-try{let r=await fetch('/update',{method:'POST',headers:CSRF_HDRS,body:fd});fwmsg.textContent=r.ok?'✓ rebooting, reconnect in ~15s':'✗ '+await r.text();}
-catch(_){fwmsg.textContent='✓ rebooting, reconnect in ~15s';}};
-upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
-upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
-let fd=new FormData();fd.append('f',f);
-try{let r=await fetch('/upload',{method:'POST',headers:CSRF_HDRS,body:fd});upmsg.textContent=r.ok?'✓ updated':'✗ '+await r.text();}
-catch(_){upmsg.textContent='✗ upload failed';}
-blf.value='';setTimeout(load,600);};
+const Q=s=>document.querySelector(s),QA=s=>document.querySelectorAll(s);
+const TZ=Math.round(-new Date().getTimezoneOffset()/60);let tzSent=0;
+const hh=n=>String(n).padStart(2,'0')+':00',hv=e=>parseInt(e.value)||0,pick=n=>Q('input[name='+n+']:checked').value;
+function showUm(){let d=pick('um')=='d';uh.hidden=d;ud.hidden=!d}
+function showNm(){nq.hidden=pick('nm')!='2'}
+function saveNight(){F('/night?m='+pick('nm')+'&from='+hv(nfrom)+'&to='+hv(nto)+'&tz='+TZ).then(()=>{nmsg.textContent='Saved';setTimeout(()=>nmsg.textContent='',1500);load()})}
+nbox.onchange=()=>{showNm();saveNight()};
+ubox.onchange=e=>{if(e.target.name=='um')showUm()};
+function addDom(){let d=dom.value.trim();if(d){F('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()})}}
+ct.onclick=e=>{let b=e.target;if(b.classList.contains('ban')&&(b.classList.contains('un')||confirm('Ban '+b.dataset.ip+'? All its DNS lookups will be blocked.')))act('/ban?ip='+b.dataset.ip)};
+cl.onclick=e=>{if(e.target.classList.contains('rmbtn'))act('/unblock?d='+encodeURIComponent(e.target.dataset.d))};
+function saveUpd(){let m=[...QA('.ud')].reduce((m,c)=>m|(c.checked?1<<c.value:0),0),d=pick('um')=='d';
+if(d&&!m){ustat.textContent='pick at least one day';return}
+F('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24)+'&d='+(d?m:0)+'&hr='+hv(uhr)).then(load)}
+function fetchNow(){ustat.textContent='fetching...';F('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
+function forgetWifi(){F('/forgetwifi').then(r=>r.text()).then(t=>alert(t))}
+const up=(F,I,M,u,v,ok,no)=>F.onsubmit=async e=>{e.preventDefault();let f=I.files[0];if(!f)return;M.textContent=v+' '+(f.size/1048576).toFixed(2)+' MB...';let fd=new FormData();fd.append('f',f);try{let r=await fetch(u,{method:'POST',headers:H,body:fd});M.textContent=r.ok?ok:'✗ '+await r.text()}catch(_){M.textContent=no}I.value='';setTimeout(load,600)};
+up(fwf,fwb,fwmsg,'/update','flashing',RB,RB);up(upf,blf,upmsg,'/upload','uploading','✓ updated','✗ upload failed');
+const chip=(t,n,v,l,x='')=>`<label class=day><input type=${t} class=${n} name=${n} value=${v} ${x}><span>${l}</span></label>`;
+ums.innerHTML=chip('radio','um','h','Every N hours','checked')+chip('radio','um','d','On set days');
+nms.innerHTML=['Day','Night','Auto'].map((l,i)=>chip('radio','nm',i,l)).join('');
+uds.innerHTML=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map((l,i)=>chip('checkbox','ud',(i+1)%7,l)).join('');
 load();setInterval(load,3000);
 </script></body></html>)HTML";
