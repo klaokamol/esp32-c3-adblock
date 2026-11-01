@@ -59,7 +59,7 @@ static uint8_t cacheRes[CACHE_SIZE];
 static uint8_t cacheValid[CACHE_SIZE];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen, macTry; String label; };
+struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, macTry; };
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
@@ -234,10 +234,10 @@ static void refreshMacs() {
   }
 }
 static Dev* getClient(uint32_t ip) {
-  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
+  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) return &clients[i];
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
-    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = c->macTry = millis(); c->label = "";
+    c->ip = ip; c->blocked = c->allowed = 0; c->macTry = millis();
     memset(c->mac, 0, 6); getMac(ip, c->mac); return c;
   }
   return nullptr;
