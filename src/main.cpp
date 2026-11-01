@@ -222,22 +222,25 @@ static void saveBanned() {
 
 // ---------- client table ----------
 static void getMac(uint32_t ip, uint8_t* mac) {
-  memset(mac, 0, 6); ip4_addr_t ipa; ipa.addr = ip;
+  ip4_addr_t ipa; ipa.addr = ip;
   struct eth_addr* eth = nullptr; const ip4_addr_t* ipret = nullptr;
   for (struct netif* nif = netif_list; nif; nif = nif->next)
     if (etharp_find_addr(nif, &ipa, &eth, &ipret) >= 0 && eth) { memcpy(mac, eth->addr, 6); return; }
 }
 static bool macUnknown(const uint8_t* m) { return !(m[0] | m[1] | m[2] | m[3] | m[4] | m[5]); }
-static Dev* getClient(uint32_t ip) {
-  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) {
-    uint32_t now = millis(); clients[i].lastSeen = now;
-    if (macUnknown(clients[i].mac) && now - clients[i].macTry >= 10000) { clients[i].macTry = now; getMac(ip, clients[i].mac); }
-    return &clients[i];
+static void refreshMacs() {
+  uint32_t now = millis();
+  for (int i = 0; i < numClients; i++) {
+    Dev& c = clients[i];
+    if (now - c.macTry >= (macUnknown(c.mac) ? 10000UL : 60000UL)) { c.macTry = now; getMac(c.ip, c.mac); }
   }
+}
+static Dev* getClient(uint32_t ip) {
+  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
     c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = c->macTry = millis(); c->banned = isBannedIP(ip); c->label = "";
-    getMac(ip, c->mac); return c;
+    memset(c->mac, 0, 6); getMac(ip, c->mac); return c;
   }
   return nullptr;
 }
@@ -440,7 +443,7 @@ static int nightLocalHour(int tzHours) {
 
 static String gapList() { String g; for (int i = 0; i < GAP_BUCKETS; i++) { g += (i ? "," : ""); g += gapHist[i]; } return g; }
 static void handleStats() {
-  uint32_t up = millis() / 1000;
+  uint32_t up = (uint32_t)(esp_timer_get_time() / 1000000);
   char ut[24];
   if (up >= 86400) snprintf(ut, sizeof(ut), "%lud %luh", up/86400, (up%86400)/3600);
   else if (up >= 3600) snprintf(ut, sizeof(ut), "%luh %lum", up/3600, (up%3600)/60);
@@ -822,7 +825,8 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
-  static uint32_t dnsCheckMs;
+  static uint32_t dnsCheckMs, macCheckMs;
+  if (millis() - macCheckMs >= 1000) { macCheckMs = millis(); refreshMacs(); }
   if (millis() - dnsCheckMs >= 60000) { dnsCheckMs = millis(); if (WiFi.isConnected() && WiFi.dnsIP() != UPSTREAM) pinDns(); }
   uiTick(totalBlocked, totalAllowed, numClients, numHashes, !blockingOn, nightActive(nightMode, nightLocalHour(nightTz), nightFrom, nightTo));
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
