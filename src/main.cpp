@@ -587,18 +587,6 @@ static void saveUiCfg() {
   File f = LittleFS.open("/ui.cfg", "w"); if (!f) return;
   f.println(nightMode); f.println(nightFrom); f.println(nightTo); f.println(clockTz); f.close();
 }
-// ponytail: one-time move of the old NVS "ui" keys into LittleFS; delete once every board has booted this firmware
-static void migrateUiPrefs() {
-  if (LittleFS.exists("/ui.cfg")) return;
-  bool had = prefs.begin("ui", true);
-  if (had) {
-    nightMode = prefs.getUChar("night", nightMode); nightFrom = prefs.getUChar("from", nightFrom); nightTo = prefs.getUChar("to", nightTo);
-    clockTz = prefs.getChar("tz", clockTz); updateDays = prefs.getUChar("ud", updateDays); updateHour = prefs.getUChar("uh", updateHour);
-    prefs.end(); saveUpdateCfg();
-  }
-  saveUiCfg();
-  if (had && LittleFS.exists("/ui.cfg") && prefs.begin("ui", false)) { prefs.clear(); prefs.end(); }
-}
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "No URL set"; return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
@@ -758,7 +746,7 @@ void setup() {
     buildFlashIndex();
   }
   loadCustom(); loadBanned(); loadUpdateCfg();
-  loadUiCfg(); migrateUiPrefs();
+  loadUiCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
