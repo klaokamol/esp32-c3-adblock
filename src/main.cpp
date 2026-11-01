@@ -562,15 +562,42 @@ static void handleUpload() {
 }
 
 // ---------- remote blocklist auto-update ----------
+static int cfgInt(File& f, int def) { String s = f.readStringUntil('\n'); s.trim(); return s.length() ? s.toInt() : def; }
 static void loadUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
-  String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
-  f.close(); updateIntervalH = constrain(updateIntervalH, 1, 168);
+  updateIntervalH = constrain(cfgInt(f, updateIntervalH), 1, 168);
+  updateDays = constrain(cfgInt(f, updateDays), 0, 127);
+  updateHour = constrain(cfgInt(f, updateHour), 0, 23);
+  f.close();
 }
 static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
-  f.println(updateUrl); f.println(updateIntervalH); f.close();
+  f.println(updateUrl); f.println(updateIntervalH); f.println(updateDays); f.println(updateHour); f.close();
+}
+static void loadUiCfg() {
+  File f = LittleFS.open("/ui.cfg", "r"); if (!f) return;
+  nightMode = constrain(cfgInt(f, nightMode), 0, 2);
+  nightFrom = constrain(cfgInt(f, nightFrom), 0, 23);
+  nightTo = constrain(cfgInt(f, nightTo), 0, 23);
+  clockTz = constrain(cfgInt(f, clockTz), -12, 14);
+  f.close();
+}
+static void saveUiCfg() {
+  File f = LittleFS.open("/ui.cfg", "w"); if (!f) return;
+  f.println(nightMode); f.println(nightFrom); f.println(nightTo); f.println(clockTz); f.close();
+}
+// ponytail: one-time move of the old NVS "ui" keys into LittleFS; delete once every board has booted this firmware
+static void migrateUiPrefs() {
+  if (LittleFS.exists("/ui.cfg")) return;
+  bool had = prefs.begin("ui", true);
+  if (had) {
+    nightMode = prefs.getUChar("night", nightMode); nightFrom = prefs.getUChar("from", nightFrom); nightTo = prefs.getUChar("to", nightTo);
+    clockTz = prefs.getChar("tz", clockTz); updateDays = prefs.getUChar("ud", updateDays); updateHour = prefs.getUChar("uh", updateHour);
+    prefs.end(); saveUpdateCfg();
+  }
+  saveUiCfg();
+  if (had && LittleFS.exists("/ui.cfg") && prefs.begin("ui", false)) { prefs.clear(); prefs.end(); }
 }
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "No URL set"; return false; }
@@ -731,7 +758,7 @@ void setup() {
     buildFlashIndex();
   }
   loadCustom(); loadBanned(); loadUpdateCfg();
-  prefs.begin("ui", true); nightMode = prefs.getUChar("night", 0); nightFrom = prefs.getUChar("from", 22); nightTo = prefs.getUChar("to", 7); clockTz = prefs.getChar("tz", 7); updateDays = prefs.getUChar("ud", 0); updateHour = prefs.getUChar("uh", 3); prefs.end();
+  loadUiCfg(); migrateUiPrefs();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
@@ -782,7 +809,7 @@ void setup() {
     if (web.hasArg("from")) nightFrom = constrain(web.arg("from").toInt(), 0, 23);
     if (web.hasArg("to")) nightTo = constrain(web.arg("to").toInt(), 0, 23);
     setClockTz();
-    if (web.args()) { prefs.begin("ui", false); prefs.putUChar("night", nightMode); prefs.putUChar("from", nightFrom); prefs.putUChar("to", nightTo); prefs.putChar("tz", clockTz); prefs.end(); }
+    if (web.args()) saveUiCfg();
     web.send(200, "text/plain", String(nightMode) + " " + nightFrom + "-" + nightTo + " tz" + clockTz + (localHour() < 0 ? " nosync" : ""));
   });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
@@ -798,8 +825,7 @@ void setup() {
     setClockTz();
     if (web.hasArg("d")) updateDays = constrain(web.arg("d").toInt(), 0, 127);
     if (web.hasArg("hr")) updateHour = constrain(web.arg("hr").toInt(), 0, 23);
-    prefs.begin("ui", false); prefs.putUChar("ud", updateDays); prefs.putUChar("uh", updateHour); prefs.putChar("tz", clockTz); prefs.end();
-    saveUpdateCfg(); web.send(200, "text/plain", "ok");
+    saveUiCfg(); saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.begin();
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
