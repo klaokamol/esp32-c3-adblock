@@ -136,6 +136,16 @@ The dashboard at **http://c3adblock.local** does it all:
 blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
 single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
 
+**Swap ceiling:** a new list is written next to the old one, and the old one is kept
+until the new one is verified, only when both fit: a list up to about **640 KB
+(~128k domains)** with a known `Content-Length` (estimated from the 1.3125 MB
+partition, 4 KB blocks and a 64 KB reserve). The weekly default list was 124,759
+domains (624 KB) on 2026-11-01 and kept the old list on the device, close to the
+edge. A bigger list, or a download without a length, replaces the old list in place: blocking
+is off while it downloads, and a failed fetch leaves no list until the next retry
+(10 minutes later). The fetch status and the upload reply end with `kept old list` or
+`replaced in place`.
+
 ## Security
 
 The dashboard's read-only view (`/`, `/stats.json`) stays open, but every

@@ -11,3 +11,7 @@ static inline bool hashesAscending(const uint8_t* b, size_t n, uint64_t* prev) {
   }
   return true;
 }
+
+static inline bool swapKeepsOld(long incoming, size_t freeBytes, size_t slack) {
+  return incoming > 0 && freeBytes >= (size_t)incoming + slack;
+}
