@@ -683,18 +683,27 @@ static bool connectWiFi() {
   return WiFi.status() == WL_CONNECTED;
 }
 
+static const char PORTAL_HEAD[] =
+  "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+  "<title>C3 AdBlock setup</title><meta name=color-scheme content=dark><style>"
+  "*{box-sizing:border-box}body{font:14px/1.45 ui-monospace,Menlo,Consolas,monospace;max-width:420px;margin:36px auto;padding:0 16px;background:#0a0a0f;color:#e8e8ee}"
+  "body::after{content:'';position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(to bottom,#00f0ff09 0 1px,transparent 1px 3px)}"
+  "h2,button{letter-spacing:.08em;text-transform:uppercase;font-weight:700}h2{font-size:14px;color:#fcee0a;text-shadow:0 0 10px #fcee0a80}h2 span{color:#00f0ff;text-shadow:none}"
+  "p{color:#9696b0;font-size:13px}b{color:#00f0ff}"
+  "input{width:100%;height:44px;margin:6px 0;padding:0 10px;border-radius:2px;border:1px solid #66668c;background:#0a0a0f;color:#e8e8ee;font:inherit}input:focus{outline:0;border-color:#00f0ff}"
+  "button{width:100%;height:44px;margin-top:8px;border:0;background:#fcee0a;color:#0a0a0f;font:inherit;font-weight:700;cursor:pointer;box-shadow:inset 0 0 10px #ffffff59;"
+  "clip-path:polygon(0 0,calc(100% - 7px) 0,100% 7px,100% 100%,7px 100%,0 calc(100% - 7px))}button:focus-visible{outline:2px solid #00f0ff;outline-offset:-3px}"
+  "</style><body>";
+
 static void handlePortalRoot() {
-  String html =
-    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>C3 AdBlock setup</title>"
-    "<meta name=color-scheme content=dark><body style='font:16px system-ui,sans-serif;max-width:420px;margin:36px auto;padding:0 16px;background:#1a1b26;color:#c0caf5'>"
-    "<h2>&#128737; C3 AdBlock &mdash; WiFi setup</h2>"
-    "<p style='color:#8089b3'>Pick your network and enter its password. The device restarts and joins it.</p>"
+  String html = String(PORTAL_HEAD) +
+    "<h2>C3 AdBlock <span>// WiFi setup</span></h2>"
+    "<p>Pick your network and enter its password. The device restarts and joins it.</p>"
     "<form method=POST action=/wifisave>"
-    "<input list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #3b4261;background:#1f2335;color:#c0caf5'>"
+    "<input list=nets name=s placeholder='WiFi name' aria-label='WiFi name' required>"
     "<datalist id=nets>" + portalOpts + "</datalist>"
-    "<input name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #3b4261;background:#1f2335;color:#c0caf5'>"
-    "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px;border:0;background:#7aa2f7;color:#16161e;font-weight:600;cursor:pointer'>Connect</button>"
+    "<input name=p type=password placeholder='Password' aria-label=Password>"
+    "<button>Connect</button>"
     "</form></body>";
   web.send(200, "text/html", html);
 }
@@ -702,9 +711,9 @@ static void handleWifiSave() {
   String ss = web.arg("s"), pw = web.arg("p");
   if (!ss.length()) { web.send(400, "text/plain", "missing WiFi name"); return; }
   prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
-  web.send(200, "text/html", "<!doctype html><meta charset=utf-8><meta name=color-scheme content=dark><body style='font:16px system-ui;text-align:center;margin-top:60px;background:#1a1b26;color:#c0caf5'>"
-                             "&#9989; Saved. Restarting and joining <b>" + htmlEscape(ss) + "</b>&hellip;<br><br>"
-                             "Reconnect your phone to your normal WiFi, then find the box at <b>c3adblock.local</b>.</body>");
+  web.send(200, "text/html", String(PORTAL_HEAD) +
+                             "<h2>Saved <span>// restarting</span></h2><p>Joining <b>" + htmlEscape(ss) + "</b>&hellip;</p>"
+                             "<p>Reconnect your phone to your normal WiFi, then find the box at <b>c3adblock.local</b>.</p></body>");
   delay(900); ESP.restart();
 }
 // Never returns — blocks in the portal loop until creds are saved (then reboots).
