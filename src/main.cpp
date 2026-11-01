@@ -5,7 +5,6 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
@@ -17,6 +16,11 @@
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/sockets.h"
+#include "esp_task.h"
+#include <freertos/message_buffer.h>
+#include "pending.h"
+#include "esp_private/wifi.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
 
@@ -41,7 +45,6 @@ static const int CACHE_SIZE = 256;       // must be power of 2
 static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
 
 // ---- globals ----
-WiFiUDP dnsServer, upstreamCli;
 WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
@@ -243,67 +246,133 @@ static int buildBlocked(int qend, uint16_t qtype) {
   const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
   memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
 }
-// Forward to upstream and wait for the reply that actually belongs to THIS query.
+// Forward to upstream without waiting: each query takes a pending slot under a fresh
+// random txid, and pollUpstream() relays the reply that actually belongs to it.
 // Issue #10: after one timeout the late reply used to sit in the socket and get relayed
-// to the next client (every answer shifted by one). Now: drain stale datagrams first,
-// send with a fresh random txid, and only accept a reply whose txid, question section,
-// and source address/port match. The client's own txid is restored on the way back.
+// to the next client (every answer shifted by one). Now a reply is only accepted when
+// its txid, question section, and source address/port match a pending query; anything
+// else is dropped. The client's own txid is restored on the way back.
 static uint8_t upPref = 0;
-static int forwardUpstream(int qlen, int qend) {
-  upstreamCli.flush();                                   // release any half-read buffer
-  while (upstreamCli.parsePacket() > 0) upstreamCli.flush();   // drop stale late replies
-  const uint8_t cid0 = buf[0], cid1 = buf[1];
-  const uint16_t wid = (uint16_t)esp_random();
-  uint8_t q[260]; int ql = qend - 12;
-  const bool haveQ = ql > 0 && ql <= (int)sizeof(q) && qend <= qlen;
-  if (haveQ) memcpy(q, buf + 12, ql);
-  buf[0] = wid >> 8; buf[1] = wid & 0xFF;
-  static uint8_t sent[512];
-  const int tries = qlen <= (int)sizeof(sent) ? 2 : 1;
-  if (tries == 2) memcpy(sent, buf, qlen);
-  for (int a = 0; a < tries; a++) {
-    const uint8_t s = upPref ^ a;
-    const IPAddress up = s ? UPSTREAM2 : UPSTREAM;
-    if (a) memcpy(buf, sent, qlen);
-    upstreamCli.beginPacket(up, UPSTREAM_PORT); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
-    const uint32_t t0 = millis();
-    while (millis() - t0 < 500) {                       // deadline, not a retry count
-      int sz = upstreamCli.parsePacket();
-      if (sz <= 0) { delay(1); continue; }
-      const bool fromUp = upstreamCli.remoteIP() == up && upstreamCli.remotePort() == UPSTREAM_PORT;
-      int n = upstreamCli.read(buf, sizeof(buf));
-      upstreamCli.flush();                                 // oversized datagram can't strand rx_buffer
-      if (!fromUp || n < 12 || sz > (int)sizeof(buf)) continue;
-      if (buf[0] != (wid >> 8) || buf[1] != (wid & 0xFF)) continue;
-      if (haveQ && (n < 12 + ql || memcmp(buf + 12, q, ql) != 0)) continue;
-      buf[0] = cid0; buf[1] = cid1;
-      upPref = s;
-      return n;
-    }
+static const int PEND_SLOTS = 16;
+static const uint32_t UPSTREAM_TIMEOUT_MS = 500;
+static PendingQuery pending[PEND_SLOTS];
+struct RxHdr { uint32_t ip; uint16_t port; };
+static int dnsFd = -1, upFd = -1;
+static MessageBufferHandle_t dnsRx, upRx;
+static volatile uint32_t rxDropped = 0;
+static void rxTask(void* arg) {
+  const int fd = (int)(intptr_t)arg;
+  MessageBufferHandle_t mb = fd == dnsFd ? dnsRx : upRx;
+  uint8_t m[sizeof(RxHdr) + sizeof(buf) + 1];
+  for (;;) {
+    sockaddr_in from; socklen_t fl = sizeof(from);
+    int n = recvfrom(fd, m + sizeof(RxHdr), sizeof(buf) + 1, 0, (sockaddr*)&from, &fl);
+    if (n < 0) { vTaskDelay(1); continue; }
+    if (n > (int)sizeof(buf)) continue;
+    RxHdr h = { from.sin_addr.s_addr, ntohs(from.sin_port) };
+    memcpy(m, &h, sizeof h);
+    if (!xMessageBufferSend(mb, m, sizeof h + n, 0)) rxDropped++;
   }
-  return 0;
+}
+static int udpOpen(uint16_t port) {
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (fd >= 0 && bind(fd, (sockaddr*)&a, sizeof a) == 0) return fd;
+  Serial.printf("[dns] socket on :%u failed\n", port);
+  if (fd >= 0) close(fd);
+  return -1;
+}
+static void dnsBegin() {
+  dnsFd = udpOpen(DNS_PORT); upFd = udpOpen(0);
+  dnsRx = xMessageBufferCreate(4096); upRx = xMessageBufferCreate(8192);
+  if (dnsFd >= 0) xTaskCreate(rxTask, "dnsrx", 4096, (void*)(intptr_t)dnsFd, ESP_TASK_TCPIP_PRIO + 1, nullptr);
+  if (upFd >= 0) xTaskCreate(rxTask, "uprx", 4096, (void*)(intptr_t)upFd, ESP_TASK_TCPIP_PRIO + 1, nullptr);
+}
+static int rxNext(MessageBufferHandle_t mb, uint32_t* ip, uint16_t* port) {
+  static uint8_t m[sizeof(RxHdr) + sizeof(buf)];
+  size_t n = xMessageBufferReceive(mb, m, sizeof m, 0);
+  if (n < sizeof(RxHdr)) return -1;
+  RxHdr h; memcpy(&h, m, sizeof h); *ip = h.ip; *port = h.port;
+  memcpy(buf, m + sizeof h, n - sizeof h);
+  return n - sizeof h;
+}
+static void udpSend(int fd, uint32_t ip, uint16_t port, const uint8_t* d, int n) {
+  sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = ip;
+  sendto(fd, d, n, 0, (sockaddr*)&a, sizeof a);
+}
+static const uint32_t GAP_EDGES_MS[] = {50, 100, 300, 1000, 3000, 10000, 30000};
+static const int GAP_BUCKETS = sizeof(GAP_EDGES_MS) / sizeof(GAP_EDGES_MS[0]) + 1;
+static uint32_t gapHist[GAP_BUCKETS], lastQueryMs = 0;
+static void countGap(uint32_t now) {
+  if (lastQueryMs) {
+    int b = 0;
+    while (b < GAP_BUCKETS - 1 && now - lastQueryMs >= GAP_EDGES_MS[b]) b++;
+    gapHist[b]++;
+  }
+  lastQueryMs = now ? now : 1;
+}
+static void forwardUpstream(uint32_t cip, uint16_t cport, int qlen, int qend) {
+  const int i = pendFree(pending, PEND_SLOTS);
+  if (i < 0) return;
+  PendingQuery& p = pending[i];
+  uint16_t wid;
+  do wid = (uint16_t)esp_random(); while (pendWidUsed(pending, PEND_SLOTS, wid));
+  p.cid = (uint16_t)(buf[0] << 8 | buf[1]); p.wid = wid;
+  buf[0] = wid >> 8; buf[1] = wid & 0xFF;
+  p.len = qlen < PEND_PKT ? qlen : PEND_PKT;
+  p.qend = qend < p.len ? qend : p.len;
+  memcpy(p.pkt, buf, p.len);
+  p.tries = qlen <= PEND_PKT ? 1 : 0;
+  p.cip = cip; p.cport = cport; p.up = upPref; p.sentTo = 1 << p.up;
+  udpSend(upFd, p.up ? (uint32_t)UPSTREAM2 : (uint32_t)UPSTREAM, UPSTREAM_PORT, buf, qlen);
+  p.sentAt = millis(); p.used = true;
+}
+static bool pollUpstream() {
+  bool did = false;
+  for (int budget = 0; budget < 16; budget++) {
+    uint32_t from; uint16_t port;
+    int n = rxNext(upRx, &from, &port); if (n < 0) break;
+    did = true;
+    const int up = port != UPSTREAM_PORT ? -1 : from == (uint32_t)UPSTREAM ? 0 : from == (uint32_t)UPSTREAM2 ? 1 : -1;
+    if (up < 0) continue;
+    const int i = pendMatch(pending, PEND_SLOTS, (uint8_t)up, buf, n);
+    if (i < 0) continue;
+    PendingQuery& p = pending[i];
+    buf[0] = p.cid >> 8; buf[1] = p.cid & 0xFF;
+    udpSend(dnsFd, p.cip, p.cport, buf, n);
+    upPref = (uint8_t)up; p.used = false;
+  }
+  for (int i; (i = pendExpired(pending, PEND_SLOTS, millis(), UPSTREAM_TIMEOUT_MS)) >= 0; ) {
+    PendingQuery& p = pending[i];
+    if (!p.tries) { p.used = false; continue; }
+    p.tries--; p.up ^= 1; p.sentTo |= 1 << p.up;
+    udpSend(upFd, p.up ? (uint32_t)UPSTREAM2 : (uint32_t)UPSTREAM, UPSTREAM_PORT, p.pkt, p.len);
+    p.sentAt = millis();
+  }
+  return did;
 }
 // Drain a whole RX burst per call (capped, so web/OTA still get a turn) instead of
 // one packet per loop iteration. Returns true if any query was handled this call.
 static bool handleDns() {
   bool did = false;
-  for (int budget = 0; budget < 16; budget++) {
-    int sz = dnsServer.parsePacket(); if (sz <= 0) break;
+  for (int budget = 0; budget < 16 && pendFree(pending, PEND_SLOTS) >= 0; budget++) {
+    if (pollUpstream()) did = true;
+    uint32_t cip; uint16_t cport;
+    int qlen = rxNext(dnsRx, &cip, &cport); if (qlen < 0) break;
     did = true;
-    IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-    int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) continue;
+    if (qlen < 13) continue;
     if ((buf[2] & 0xF8) != 0 || ((buf[4] << 8) | buf[5]) != 1) continue;
+    countGap(millis());
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
-    Dev* c = getClient((uint32_t)cip);
+    Dev* c = getClient(cip);
     bool ban = c && c->banned;
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
-    int rlen;
-    if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-    else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
-    if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+    if (!blocked) { forwardUpstream(cip, cport, qlen, dl ? qend : 12); totalAllowed++; if (c) c->allowed++; continue; }
+    int rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
+    udpSend(dnsFd, cip, cport, buf, rlen);
   }
-  return did;
+  return pollUpstream() || did;
 }
 
 // ---------- web ----------
@@ -335,12 +404,13 @@ static String htmlEscape(const String& s) {
 #include "hashlist.h"
 static_assert(HASH_BYTES == 5, "hashlist.h assumes 5-byte hashes");
 
+static String gapList() { String g; for (int i = 0; i < GAP_BUCKETS; i++) { g += (i ? "," : ""); g += gapHist[i]; } return g; }
 static void handleStats() {
   uint32_t up = millis() / 1000;
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
-             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
+             ",\"heap\":" + ESP.getFreeHeap() + ",\"rxdrop\":" + rxDropped + ",\"ps\":" + (int)WiFi.getSleep() + ",\"gaps\":[" + gapList() + "]" + ",\"uptime\":\"" + ut + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
@@ -545,6 +615,7 @@ static bool hasCreds() {
   prefs.begin("wifi", true); bool nvs = prefs.getString("ssid", "").length() > 0; prefs.end();
   return nvs || (WIFI_SSID && *WIFI_SSID && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0);
 }
+static const uint32_t WIFI_AWAKE_MS = 300;
 static bool connectWiFi() {
   prefs.begin("wifi", true);
   String ss = prefs.getString("ssid", "");
@@ -554,6 +625,9 @@ static bool connectWiFi() {
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
+  WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) {
+    esp_wifi_set_sleep_min_active_time(WIFI_AWAKE_MS * 1000);  // ponytail: private IDF API (esp_private/wifi.h), may vanish on an IDF bump; then set CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME in a custom sdkconfig build
+  }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.mode(WIFI_STA); WiFi.setSleep(WIFI_PS_MIN_MODEM); WiFi.begin(ssid, pass);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
@@ -649,7 +723,7 @@ void setup() {
                     "(they're in the repo's example file). Set real values before trusting this "
                     "device on a network you don't fully control.");
 
-  dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+  dnsBegin();
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
@@ -661,6 +735,12 @@ void setup() {
     long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
     blockingOn = false; resumeAt = (s > 0) ? millis() + (uint32_t)s * 1000UL : 0;
     web.send(200, "text/plain", "paused");
+  });
+  web.on("/ps", []() {
+    if (!requireAuth()) return;
+    if (web.hasArg("m")) WiFi.setSleep(web.arg("m") == "none" ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+    if (web.hasArg("a")) esp_wifi_set_sleep_min_active_time((uint32_t)web.arg("a").toInt() * 1000);
+    web.send(200, "text/plain", "ok");
   });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
   web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");
