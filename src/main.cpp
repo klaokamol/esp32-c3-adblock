@@ -428,6 +428,7 @@ static String htmlEscape(const String& s) {
 }
 
 #include "page.h"   // dashboard HTML (PROGMEM) — see issue #6
+#include "page_gz.h"
 #include "board_ui.h"
 #include "hashlist.h"
 static_assert(HASH_BYTES == 5, "hashlist.h assumes 5-byte hashes");
@@ -803,7 +804,7 @@ void setup() {
 
   dnsBegin();
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
-  web.on("/", []() { web.send_P(200, "text/html", PAGE); });
+  web.on("/", []() { web.sendHeader("Content-Encoding", "gzip"); web.send_P(200, "text/html", (const char*)PAGE_GZ, sizeof PAGE_GZ); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
   web.on("/addblock", []() {
