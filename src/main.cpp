@@ -20,6 +20,7 @@
 #include "esp_task.h"
 #include <freertos/message_buffer.h>
 #include "pending.h"
+#include "banlist.h"
 #include "esp_private/wifi.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
@@ -58,15 +59,14 @@ static uint8_t cacheRes[CACHE_SIZE];
 static uint8_t cacheValid[CACHE_SIZE];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen, macTry; bool banned; String label; };
+struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen, macTry; String label; };
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
 static const int MAX_CUSTOM = 200;
 String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0;
 
-static const int MAX_BAN = 32;
-uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
+static BanList bans;
 
 // remote blocklist auto-update
 String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
@@ -206,18 +206,16 @@ static void removeCustom(String d) {
     numCustom--; saveCustom(); return;
   }
 }
-static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
 static void loadBanned() {
-  numBanned = 0; File f = LittleFS.open("/banned.txt", "r"); if (!f) return;
-  while (f.available() && numBanned < MAX_BAN) { String l = f.readStringUntil('\n'); l.trim(); IPAddress ip; if (l.length() && ip.fromString(l)) bannedIP[numBanned++] = (uint32_t)ip; }
+  bans.n = 0; File f = LittleFS.open("/banned.txt", "r"); if (!f) return;
+  while (f.available()) { String l = f.readStringUntil('\n'); l.trim(); IPAddress ip; if (l.length() && ip.fromString(l)) banAdd(bans, (uint32_t)ip); }
   f.close();
 }
-static void saveBanned() {
-  numBanned = 0;
-  for (int i = 0; i < numClients && numBanned < MAX_BAN; i++) if (clients[i].banned) bannedIP[numBanned++] = clients[i].ip;
-  File f = LittleFS.open("/banned.txt", "w"); if (!f) return;
-  for (int i = 0; i < numBanned; i++) { IPAddress ip(bannedIP[i]); f.println(ip.toString()); }
+static bool saveBanned() {
+  File f = LittleFS.open("/banned.txt", "w"); if (!f) return false;
+  for (int i = 0; i < bans.n; i++) { IPAddress ip(bans.ip[i]); f.println(ip.toString()); }
   f.close();
+  return true;
 }
 
 // ---------- client table ----------
@@ -239,7 +237,7 @@ static Dev* getClient(uint32_t ip) {
   for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
-    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = c->macTry = millis(); c->banned = isBannedIP(ip); c->label = "";
+    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = c->macTry = millis(); c->label = "";
     memset(c->mac, 0, 6); getMac(ip, c->mac); return c;
   }
   return nullptr;
@@ -381,7 +379,7 @@ static bool handleDns() {
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
     Dev* c = getClient(cip);
-    bool ban = c && c->banned;
+    bool ban = banHas(bans, cip);
     bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
     if (!blocked) { forwardUpstream(cip, cport, qlen, dl ? qend : 12); totalAllowed++; if (c) c->allowed++; continue; }
     int rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
@@ -448,7 +446,12 @@ static void handleStats() {
              ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
-    j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+    j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (banHas(bans, c.ip)?"true":"false") + "}"; }
+  for (int b = 0, n = numClients; b < bans.n; b++) {
+    bool seen = false;
+    for (int i = 0; i < numClients && !seen; i++) seen = clients[i].ip == bans.ip[b];
+    if (!seen) { j += (n++ ? "," : ""); j += "{\"ip\":\"" + IPAddress(bans.ip[b]).toString() + "\",\"mac\":\"—\",\"blocked\":0,\"allowed\":0,\"banned\":true}"; }
+  }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
   j += "]}";
@@ -477,7 +480,9 @@ static bool requireAuth() {
 }
 static void handleBan() {
   if (!requireAuth()) return;
-  IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient((uint32_t)ip); if (c) { c->banned = !c->banned; saveBanned(); } }
+  IPAddress ip; if (!ip.fromString(web.arg("ip"))) { web.send(400, "text/plain", "bad IP"); return; }
+  if (banToggle(bans, (uint32_t)ip) < 0) { web.send(409, "text/plain", "ban list full"); return; }
+  if (!saveBanned()) { banToggle(bans, (uint32_t)ip); web.send(500, "text/plain", "ban not saved"); return; }
   web.send(200, "text/plain", "ok");
 }
 
@@ -756,7 +761,7 @@ void setup() {
   }
   loadCustom(); loadBanned(); loadUpdateCfg();
   loadUiCfg();
-  Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
+  Serial.printf("custom: %d, banned: %d\n", numCustom, bans.n);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
 #if CONFIG_IDF_TARGET_ESP32C3
