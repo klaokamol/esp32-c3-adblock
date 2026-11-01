@@ -511,9 +511,11 @@ static void reopenBlocklist() {
   buildFlashIndex();
 }
 static const size_t SWAP_SLACK = 16 * 4096;
+static bool swapKept = false;
 static void beginBlocklistSwap(int incoming) {
   LittleFS.remove("/blocklist.new");
-  if (incoming > 0 && LittleFS.totalBytes() - LittleFS.usedBytes() >= (size_t)incoming + SWAP_SLACK) return;
+  swapKept = swapKeepsOld(incoming, LittleFS.totalBytes() - LittleFS.usedBytes(), SWAP_SLACK);
+  if (swapKept) return;
   if (blocklist) blocklist.close();
   numHashes = 0;
   LittleFS.remove(BLOCKLIST_PATH);
@@ -535,22 +537,41 @@ static bool commitNewBlocklist() {                  // /blocklist.new -> live (v
   bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
   ok = ok && blobSorted(f);
   if (f) f.close();
-  if (ok) { if (blocklist) blocklist.close(); LittleFS.remove(BLOCKLIST_PATH); LittleFS.rename("/blocklist.new", BLOCKLIST_PATH); }
-  else    LittleFS.remove("/blocklist.new");
+  if (ok) { if (blocklist) blocklist.close(); ok = LittleFS.rename("/blocklist.new", BLOCKLIST_PATH); }
+  if (!ok) LittleFS.remove("/blocklist.new");
   reopenBlocklist();
   return ok;
 }
+static const char* swapPath() { return swapKept ? "kept old list" : "replaced in place"; }
+static File swapFile;
+static bool swapStart(int incoming) {
+  beginBlocklistSwap(incoming);
+  swapFile = LittleFS.open("/blocklist.new", "w");
+  if (!swapFile) reopenBlocklist();
+  return swapFile;
+}
+static bool swapWrite(const uint8_t* b, size_t n) {
+  if (swapFile && swapFile.write(b, n) == n) return true;
+  if (swapFile) swapFile.close();
+  return false;
+}
+static void swapAbort() { if (swapFile) swapFile.close(); LittleFS.remove("/blocklist.new"); reopenBlocklist(); }
+enum SwapResult { SWAP_OK, SWAP_FULL, SWAP_BAD, SWAP_CUT };
+static SwapResult swapFinish(size_t total) {
+  if (swapFile) swapFile.close();
+  if (!landed(total)) { swapAbort(); return SWAP_FULL; }
+  return commitNewBlocklist() ? SWAP_OK : SWAP_BAD;
+}
 
 // ---------- OTA blocklist update (browser upload) ----------
-static bool upOk = false;
-static bool upFull = false;
 static bool upAuthOk = false;
-static File upFile;
+static SwapResult upRes = SWAP_BAD;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
-  web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : upFull ? "Rejected: blocklist does not fit the filesystem"
-                       : "Rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+  String msg = upRes == SWAP_OK ? "ok" : upRes == SWAP_FULL ? "Rejected: blocklist does not fit the filesystem"
+                                       : "Rejected: empty or size not a multiple of 5 (not a blocklist.bin?)";
+  web.send(upRes == SWAP_OK ? 200 : 500, "text/plain", msg + " (" + swapPath() + ")");
+  upAuthOk = false; upRes = SWAP_BAD;
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -558,25 +579,20 @@ static void handleUpload() {
     case UPLOAD_FILE_START:
       upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
-      upOk = false; upFull = false; beginBlocklistSwap(web.clientContentLength());
-      upFile = LittleFS.open("/blocklist.new", "w");
+      upRes = SWAP_BAD; swapStart(web.hasArg("n") ? web.arg("n").toInt() : web.clientContentLength());
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
-      if (upAuthOk && upFile) upFile.write(u.buf, u.currentSize);
+      if (upAuthOk) swapWrite(u.buf, u.currentSize);
       break;
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
-      if (upFile) upFile.close();
-      upFull = !landed(u.totalSize);
-      if (upFull) LittleFS.remove("/blocklist.new");
-      upOk = commitNewBlocklist();
-      Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
+      upRes = swapFinish(u.totalSize);
+      Serial.printf("[ota] %s -> %u domains, %s\n", upRes == SWAP_OK ? "OK" : "REJECTED", numHashes, swapPath());
       break;
     case UPLOAD_FILE_ABORTED:
       if (!upAuthOk) break;
-      if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new"); reopenBlocklist();
+      swapAbort();
       Serial.println("[ota] aborted");
       break;
   }
@@ -614,29 +630,24 @@ static bool fetchBlocklist(String url) {
   int code = http.GET();
   if (code != HTTP_CODE_OK) { updateStatus = "HTTP " + String(code) + " " + HTTPClient::errorToString(code) + ", heap " + String(ESP.getFreeHeap() / 1024) + "K"; http.end(); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
   int len = http.getSize();
-  beginBlocklistSwap(len);
-  File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "FS open failed"; reopenBlocklist(); return false; }
+  if (!swapStart(len)) { http.end(); updateStatus = String("FS open failed, ") + swapPath(); return false; }
   WiFiClient* stream = http.getStreamPtr();
   uint8_t b[1024]; size_t total = 0; uint32_t idle = millis(); bool stalled = false, full = false;
   while (http.connected() && (len < 0 || (int)total < len)) {
     bool dns = handleDns();
     size_t avail = stream->available();
-    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { if (f.write(b, n) != (size_t)n) { full = true; break; } total += n; idle = millis(); } }
+    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { if (!swapWrite(b, n)) { full = true; break; } total += n; idle = millis(); } }
     else { if (millis() - idle > 15000) { stalled = true; break; } if (!dns) delay(2); }
   }
-  f.close(); http.end();
-  full = full || !landed(total);
-  if (stalled || full || (len > 0 && total != (size_t)len)) {
-    LittleFS.remove("/blocklist.new"); reopenBlocklist();
-    updateStatus = (full ? "FS full (" : "Truncated (") + String(total) + "/" + String(len) + "B)";
-    Serial.printf("[remote] %s\n", updateStatus.c_str());
-    return false;
-  }
-  bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("OK, " + grouped(numHashes) + " domains" + clockStamp()) : ("Bad data (" + String(total) + "B)");
+  http.end();
+  SwapResult r = full ? SWAP_FULL : stalled || (len > 0 && total != (size_t)len) ? SWAP_CUT : SWAP_OK;
+  if (r != SWAP_OK) swapAbort(); else r = swapFinish(total);
+  updateStatus = r == SWAP_OK ? "OK, " + grouped(numHashes) + " domains" + clockStamp()
+               : r == SWAP_BAD ? "Bad data (" + String(total) + "B)"
+               : (r == SWAP_FULL ? "FS full (" : "Truncated (") + String(total) + "/" + String(len) + "B)";
+  updateStatus += String(", ") + swapPath();
   Serial.printf("[remote] %s\n", updateStatus.c_str());
-  return ok;
+  return r == SWAP_OK;
 }
 
 // ---------- firmware OTA (browser upload of firmware.bin -> reboot) ----------
@@ -762,12 +773,8 @@ void setup() {
   Serial.println("\n[c3-adblock] booting");
   uiBegin(); oledLines("C3 ADBLOCK", "booting...");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) {
-    numHashes = blocklist.size() / HASH_BYTES;
-    Serial.printf("blocklist: %u domains\n", numHashes);
-    buildFlashIndex();
-  }
+  reopenBlocklist();
+  if (blocklist) Serial.printf("blocklist: %u domains\n", numHashes);
   loadCustom(); loadBanned(); loadSettings();
   Serial.printf("custom: %d, banned: %d\n", numCustom, bans.n);
 
