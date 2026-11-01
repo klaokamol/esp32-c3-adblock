@@ -20,3 +20,7 @@ src/secrets.h
 
 # Python bytecode
 __pycache__/
+
+# Design notes from the impeccable tool
+.impeccable/
+PRODUCT.md
