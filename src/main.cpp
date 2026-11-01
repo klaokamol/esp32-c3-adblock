@@ -434,7 +434,8 @@ static bool localClock(int tzHours, int& day, int& hour) {
 static String grouped(uint32_t n) { String s(n); for (int i = s.length() - 3; i > 0; i -= 3) s = s.substring(0, i) + "," + s.substring(i); return s; }
 static String clockStamp() {
   time_t l; if (!localTime(nightTz, l)) return "";
-  char b[20]; strftime(b, sizeof(b), ", %b %d %H:%M", gmtime(&l)); return b;
+  char b[20]; strftime(b, sizeof(b), ", %b %d %H:%M", gmtime(&l));
+  return String(b) + " UTC" + (nightTz >= 0 ? "+" : "") + nightTz;
 }
 static int nightLocalHour(int tzHours) {
   int d, h;
