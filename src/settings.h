@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { S_UPIV, S_UPDAYS, S_UPHOUR, S_NMODE, S_NFROM, S_NTO, S_TZ, S_COUNT };
+enum { S_UPIV, S_UPDAYS, S_UPHOUR, S_NMODE, S_NFROM, S_NTO, S_TZ, S_LASTDAY, S_COUNT };
 
 struct SettingDef { const char* key; long def, lo, hi; };
 
@@ -15,6 +15,7 @@ static const SettingDef SETTINGS[S_COUNT] = {
   {"nfrom", 22, 0, 23},
   {"nto", 7, 0, 23},
   {"tz", 7, -12, 14},
+  {"lastday", -1, -1, 1000000},
 };
 
 static inline long settingClamp(int i, long v) {

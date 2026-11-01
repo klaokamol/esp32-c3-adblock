@@ -79,7 +79,7 @@ long&    updateIntervalH = cfg[S_UPIV]; // hours between auto-fetches
 uint32_t lastCheckMs = 0;
 long&    updateDays = cfg[S_UPDAYS]; // bit0 Sun..bit6 Sat; 0 = use updateIntervalH instead
 long&    updateHour = cfg[S_UPHOUR];
-int      lastSchedDay = -1;
+long&    lastSchedDay = cfg[S_LASTDAY];
 String updateStatus = "Never";
 
 // WiFi provisioning (captive portal)
@@ -863,7 +863,7 @@ void loop() {
     if (updateDays) {
       if (nowLocal(day, dow, hour) && updateDue(updateDays, dow, hour, updateHour, day, lastSchedDay) && now - lastCheckMs >= 600000UL) {
         lastCheckMs = now;
-        if (fetchBlocklist(updateUrl) || numHashes > 0) lastSchedDay = day;
+        if (fetchBlocklist(updateUrl) || numHashes > 0) { lastSchedDay = day; saveSettings(); }
       }
     }
     else if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
