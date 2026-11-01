@@ -36,6 +36,7 @@
 #endif
 static const IPAddress UPSTREAM(UPSTREAM_IP);
 static const IPAddress UPSTREAM2(UPSTREAM2_IP);
+static void pinDns() { WiFi.setDNS(UPSTREAM, UPSTREAM2); }
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
@@ -57,7 +58,7 @@ static uint8_t cacheRes[CACHE_SIZE];
 static uint8_t cacheValid[CACHE_SIZE];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
+struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen, macTry; bool banned; String label; };
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
@@ -74,7 +75,7 @@ uint32_t lastCheckMs = 0;
 uint8_t  updateDays = 0;            // bit0 Sun..bit6 Sat; 0 = use updateIntervalH instead
 uint8_t  updateHour = 3;
 int      lastSchedDay = -1;
-String updateStatus = "never";
+String updateStatus = "Never";
 
 // WiFi provisioning (captive portal)
 Preferences prefs;
@@ -221,17 +222,25 @@ static void saveBanned() {
 
 // ---------- client table ----------
 static void getMac(uint32_t ip, uint8_t* mac) {
-  memset(mac, 0, 6); ip4_addr_t ipa; ipa.addr = ip;
+  ip4_addr_t ipa; ipa.addr = ip;
   struct eth_addr* eth = nullptr; const ip4_addr_t* ipret = nullptr;
   for (struct netif* nif = netif_list; nif; nif = nif->next)
     if (etharp_find_addr(nif, &ipa, &eth, &ipret) >= 0 && eth) { memcpy(mac, eth->addr, 6); return; }
+}
+static bool macUnknown(const uint8_t* m) { return !(m[0] | m[1] | m[2] | m[3] | m[4] | m[5]); }
+static void refreshMacs() {
+  uint32_t now = millis();
+  for (int i = 0; i < numClients; i++) {
+    Dev& c = clients[i];
+    if (now - c.macTry >= (macUnknown(c.mac) ? 10000UL : 60000UL)) { c.macTry = now; getMac(c.ip, c.mac); }
+  }
 }
 static Dev* getClient(uint32_t ip) {
   for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
-    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
-    getMac(ip, c->mac); return c;
+    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = c->macTry = millis(); c->banned = isBannedIP(ip); c->label = "";
+    memset(c->mac, 0, 6); getMac(ip, c->mac); return c;
   }
   return nullptr;
 }
@@ -382,7 +391,7 @@ static bool handleDns() {
 }
 
 // ---------- web ----------
-static String macStr(const uint8_t* m) { char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
+static String macStr(const uint8_t* m) { if (macUnknown(m)) return "—"; char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
 static String jesc(const String& s) { String o; for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; } return o; }
 // HTML text/attribute escaping for the setup portal. jesc() covers JSON (stats
 // endpoint); the portal builds HTML, and its inputs — a scanned SSID, the
@@ -410,12 +419,23 @@ static String htmlEscape(const String& s) {
 #include "hashlist.h"
 static_assert(HASH_BYTES == 5, "hashlist.h assumes 5-byte hashes");
 
-static bool localClock(int tzHours, int& day, int& hour) {
+static bool localTime(int tzHours, time_t& l) {
   time_t t = time(nullptr);
   if (t < 1700000000) return false;
-  time_t l = t + tzHours * 3600;
+  l = t + tzHours * 3600;
+  return true;
+}
+static bool localClock(int tzHours, int& day, int& hour) {
+  time_t l;
+  if (!localTime(tzHours, l)) return false;
   day = (int)(l / 86400); hour = (int)(l / 3600 % 24);
   return true;
+}
+static String grouped(uint32_t n) { String s(n); for (int i = s.length() - 3; i > 0; i -= 3) s = s.substring(0, i) + "," + s.substring(i); return s; }
+static String clockStamp() {
+  time_t l; if (!localTime(nightTz, l)) return "";
+  char b[20]; strftime(b, sizeof(b), ", %b %d %H:%M", gmtime(&l));
+  return String(b) + " UTC" + (nightTz >= 0 ? "+" : "") + nightTz;
 }
 static int nightLocalHour(int tzHours) {
   int d, h;
@@ -424,11 +444,18 @@ static int nightLocalHour(int tzHours) {
 
 static String gapList() { String g; for (int i = 0; i < GAP_BUCKETS; i++) { g += (i ? "," : ""); g += gapHist[i]; } return g; }
 static void handleStats() {
-  uint32_t up = millis() / 1000;
-  char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
+  uint32_t up = (uint32_t)(esp_timer_get_time() / 1000000);
+  char ut[24];
+  if (up >= 86400) snprintf(ut, sizeof(ut), "%lud %luh", up/86400, (up%86400)/3600);
+  else if (up >= 3600) snprintf(ut, sizeof(ut), "%luh %lum", up/3600, (up%3600)/60);
+  else if (up >= 60) snprintf(ut, sizeof(ut), "%lum", up/60);
+  else snprintf(ut, sizeof(ut), "%lus", up);
+  int rssi = WiFi.RSSI(); String temp = String(temperatureRead(), 1); uint32_t heap = ESP.getFreeHeap();
+  String sys = "Wi-Fi " + String(rssi) + " dBm · chip " + temp + " °C · " + String(heap / 1024) + " KB RAM free · up " + ut;
+  sys.replace(" ", "\u00a0"); sys.replace("\u00a0\u00b7\u00a0", " \u00b7 ");
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
-             ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
-             ",\"heap\":" + ESP.getFreeHeap() + ",\"rxdrop\":" + rxDropped + ",\"ps\":" + (int)WiFi.getSleep() + ",\"gaps\":[" + gapList() + "]" + ",\"uptime\":\"" + ut + "\"" +
+             ",\"domains\":" + numHashes + ",\"rssi\":" + rssi + ",\"temp\":" + temp +
+             ",\"heap\":" + heap + ",\"rxdrop\":" + rxDropped + ",\"ps\":" + (int)WiFi.getSleep() + ",\"gaps\":[" + gapList() + "]" + ",\"uptime\":\"" + ut + "\",\"sys\":\"" + sys + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"updays\":" + updateDays + ",\"uphour\":" + updateHour + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"nmode\":" + nightMode + ",\"nfrom\":" + nightFrom + ",\"nto\":" + nightTo + ",\"ntz\":" + nightTz + ",\"nhour\":" + nightLocalHour(nightTz) +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
@@ -516,8 +543,8 @@ static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : upFull ? "rejected: blocklist does not fit the filesystem"
-                       : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+           upOk ? "ok" : upFull ? "Rejected: blocklist does not fit the filesystem"
+                       : "Rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -561,21 +588,21 @@ static void saveUpdateCfg() {
   f.println(updateUrl); f.println(updateIntervalH); f.close();
 }
 static bool fetchBlocklist(String url) {
-  url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
+  url.trim(); if (!url.length()) { updateStatus = "No URL set"; return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
-  WiFi.setDNS(UPSTREAM);
+  pinDns();
   WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
   WiFiClient cl;
   HTTPClient http; http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
   bool https = url.startsWith("https");
-  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
+  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "Begin failed"; return false; }
   int code = http.GET();
   if (code != HTTP_CODE_OK) { updateStatus = "HTTP " + String(code) + " " + HTTPClient::errorToString(code) + ", heap " + String(ESP.getFreeHeap() / 1024) + "K"; http.end(); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
   int len = http.getSize();
   beginBlocklistSwap(len);
   File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
+  if (!f) { http.end(); updateStatus = "FS open failed"; reopenBlocklist(); return false; }
   WiFiClient* stream = http.getStreamPtr();
   uint8_t b[1024]; size_t total = 0; uint32_t idle = millis(); bool stalled = false, full = false;
   while (http.connected() && (len < 0 || (int)total < len)) {
@@ -588,12 +615,12 @@ static bool fetchBlocklist(String url) {
   full = full || !landed(total);
   if (stalled || full || (len > 0 && total != (size_t)len)) {
     LittleFS.remove("/blocklist.new"); reopenBlocklist();
-    updateStatus = (full ? "fs full (" : "truncated (") + String(total) + "/" + String(len) + "B)";
+    updateStatus = (full ? "FS full (" : "Truncated (") + String(total) + "/" + String(len) + "B)";
     Serial.printf("[remote] %s\n", updateStatus.c_str());
     return false;
   }
   bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
+  updateStatus = ok ? ("OK, " + grouped(numHashes) + " domains" + clockStamp()) : ("Bad data (" + String(total) + "B)");
   Serial.printf("[remote] %s\n", updateStatus.c_str());
   return ok;
 }
@@ -603,7 +630,7 @@ static bool fwAuthOk = false;
 static void handleFwUpdateDone() {
   if (!fwAuthOk) { web.requestAuthentication(); return; }
   bool ok = !Update.hasError();
-  web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
+  web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "Firmware update failed");
   if (ok) { delay(300); ESP.restart(); }
 }
 static void handleFwUpload() {
@@ -645,6 +672,7 @@ static bool connectWiFi() {
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
   WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) {
+    pinDns();
     esp_wifi_set_sleep_min_active_time(WIFI_AWAKE_MS * 1000);  // ponytail: private IDF API (esp_private/wifi.h), may vanish on an IDF bump; then set CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME in a custom sdkconfig build
   }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.mode(WIFI_STA); WiFi.setSleep(WIFI_PS_MIN_MODEM); WiFi.begin(ssid, pass);
@@ -659,14 +687,14 @@ static void handlePortalRoot() {
   String html =
     "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>C3 AdBlock setup</title>"
-    "<body style='font:16px system-ui,sans-serif;max-width:420px;margin:36px auto;padding:0 16px;background:#0d1117;color:#c9d1d9'>"
+    "<meta name=color-scheme content=dark><body style='font:16px system-ui,sans-serif;max-width:420px;margin:36px auto;padding:0 16px;background:#1a1b26;color:#c0caf5'>"
     "<h2>&#128737; C3 AdBlock &mdash; WiFi setup</h2>"
-    "<p style='color:#8b949e'>Pick your network and enter its password. The device restarts and joins it.</p>"
+    "<p style='color:#8089b3'>Pick your network and enter its password. The device restarts and joins it.</p>"
     "<form method=POST action=/wifisave>"
-    "<input list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
+    "<input list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #3b4261;background:#1f2335;color:#c0caf5'>"
     "<datalist id=nets>" + portalOpts + "</datalist>"
-    "<input name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
-    "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px;border:0;background:#3fb950;color:#000;font-weight:600;cursor:pointer'>Connect</button>"
+    "<input name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #3b4261;background:#1f2335;color:#c0caf5'>"
+    "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px;border:0;background:#7aa2f7;color:#16161e;font-weight:600;cursor:pointer'>Connect</button>"
     "</form></body>";
   web.send(200, "text/html", html);
 }
@@ -674,7 +702,7 @@ static void handleWifiSave() {
   String ss = web.arg("s"), pw = web.arg("p");
   if (!ss.length()) { web.send(400, "text/plain", "missing WiFi name"); return; }
   prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
-  web.send(200, "text/html", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
+  web.send(200, "text/html", "<!doctype html><meta charset=utf-8><meta name=color-scheme content=dark><body style='font:16px system-ui;text-align:center;margin-top:60px;background:#1a1b26;color:#c0caf5'>"
                              "&#9989; Saved. Restarting and joining <b>" + htmlEscape(ss) + "</b>&hellip;<br><br>"
                              "Reconnect your phone to your normal WiFi, then find the box at <b>c3adblock.local</b>.</body>");
   delay(900); ESP.restart();
@@ -773,7 +801,7 @@ void setup() {
     web.send(200, "text/plain", String(nightMode) + " " + nightFrom + "-" + nightTo + " tz" + nightTz + (nightLocalHour(nightTz) < 0 ? " nosync" : ""));
   });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
-  web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");
+  web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "Wi-Fi cleared, rebooting into setup");
     prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA (auth inside handleUpload)
   web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA (auth inside handleFwUpload)
@@ -798,6 +826,9 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
+  static uint32_t dnsCheckMs, macCheckMs;
+  if (millis() - macCheckMs >= 1000) { macCheckMs = millis(); refreshMacs(); }
+  if (millis() - dnsCheckMs >= 60000) { dnsCheckMs = millis(); if (WiFi.isConnected() && WiFi.dnsIP() != UPSTREAM) pinDns(); }
   uiTick(totalBlocked, totalAllowed, numClients, numHashes, !blockingOn, nightActive(nightMode, nightLocalHour(nightTz), nightFrom, nightTo));
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
