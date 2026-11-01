@@ -34,6 +34,13 @@ static inline bool updateDue(uint8_t days, int dow, int hour, int atHour, int da
   return (days >> dow & 1) && hour >= atHour && day != lastDay;
 }
 
+static inline bool splitLocal(int64_t utc, int tz, int& day, int& dow, int& hour) {
+  if (utc < 1700000000) return false;
+  int64_t l = utc + (int64_t)tz * 3600;
+  day = (int)(l / 86400); dow = (day + 4) % 7; hour = (int)(l / 3600 % 24);
+  return true;
+}
+
 static const uint32_t SCREEN_MS = 60000;
 
 static inline bool screenAwake(uint32_t now, uint32_t lastWake) {
@@ -153,7 +160,7 @@ static void uiTick(uint32_t blocked, uint32_t allowed, int clients, uint32_t dom
   snprintf(s, sizeof s, "C:%d", clients); oledPut(0, 2, s);
   fmtCount(v, sizeof v, domains); snprintf(s, sizeof s, "D:%s", v); oledPut(COL2, 2, s);
   snprintf(s, sizeof s, "T:%.0fC", temperatureRead()); oledPut(0, 3, s);
-  fmtUptime(v, sizeof v, now / 1000); snprintf(s, sizeof s, "U:%s", v); oledPut(COL2, 3, s);
+  fmtUptime(v, sizeof v, (uint32_t)(esp_timer_get_time() / 1000000)); snprintf(s, sizeof s, "U:%s", v); oledPut(COL2, 3, s);
   oledFlush();
 }
 #else

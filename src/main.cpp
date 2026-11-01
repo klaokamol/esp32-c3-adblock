@@ -87,7 +87,7 @@ bool     blockingOn = true;
 uint32_t resumeAt   = 0;            // millis() to auto-resume; 0 = paused indefinitely / not paused
 uint8_t  nightMode  = 0;
 uint8_t  nightFrom  = 22, nightTo = 7;
-int8_t   nightTz    = 7;            // hours from UTC
+int8_t   clockTz    = 7;            // hours from UTC
 
 // ---------- hashing / matching ----------
 static uint64_t fnv40(const char* s, size_t n) {
@@ -419,27 +419,16 @@ static String htmlEscape(const String& s) {
 #include "hashlist.h"
 static_assert(HASH_BYTES == 5, "hashlist.h assumes 5-byte hashes");
 
-static bool localTime(int tzHours, time_t& l) {
-  time_t t = time(nullptr);
-  if (t < 1700000000) return false;
-  l = t + tzHours * 3600;
-  return true;
-}
-static bool localClock(int tzHours, int& day, int& hour) {
-  time_t l;
-  if (!localTime(tzHours, l)) return false;
-  day = (int)(l / 86400); hour = (int)(l / 3600 % 24);
-  return true;
-}
+static bool nowLocal(int& day, int& dow, int& hour) { return splitLocal(time(nullptr), clockTz, day, dow, hour); }
+static int localHour() { int d, w, h; return nowLocal(d, w, h) ? h : -1; }
+// ponytail: whole-hour zones and no DST rules; +5:30 rounds to +6, store minutes and a POSIX TZ string if that matters
+static void setClockTz() { if (web.hasArg("tz")) clockTz = constrain(web.arg("tz").toInt(), -12, 14); }
 static String grouped(uint32_t n) { String s(n); for (int i = s.length() - 3; i > 0; i -= 3) s = s.substring(0, i) + "," + s.substring(i); return s; }
 static String clockStamp() {
-  time_t l; if (!localTime(nightTz, l)) return "";
+  if (localHour() < 0) return "";
+  time_t l = time(nullptr) + clockTz * 3600;
   char b[20]; strftime(b, sizeof(b), ", %b %d %H:%M", gmtime(&l));
-  return String(b) + " UTC" + (nightTz >= 0 ? "+" : "") + nightTz;
-}
-static int nightLocalHour(int tzHours) {
-  int d, h;
-  return localClock(tzHours, d, h) ? h : -1;
+  return String(b) + " UTC" + (clockTz >= 0 ? "+" : "") + clockTz;
 }
 
 static String gapList() { String g; for (int i = 0; i < GAP_BUCKETS; i++) { g += (i ? "," : ""); g += gapHist[i]; } return g; }
@@ -457,7 +446,7 @@ static void handleStats() {
              ",\"domains\":" + numHashes + ",\"rssi\":" + rssi + ",\"temp\":" + temp +
              ",\"heap\":" + heap + ",\"rxdrop\":" + rxDropped + ",\"ps\":" + (int)WiFi.getSleep() + ",\"gaps\":[" + gapList() + "]" + ",\"uptime\":\"" + ut + "\",\"sys\":\"" + sys + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"updays\":" + updateDays + ",\"uphour\":" + updateHour + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
-             ",\"nmode\":" + nightMode + ",\"nfrom\":" + nightFrom + ",\"nto\":" + nightTo + ",\"ntz\":" + nightTz + ",\"nhour\":" + nightLocalHour(nightTz) +
+             ",\"nmode\":" + nightMode + ",\"nfrom\":" + nightFrom + ",\"nto\":" + nightTo + ",\"ntz\":" + clockTz + ",\"nhour\":" + localHour() +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
@@ -581,7 +570,7 @@ static void loadUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
   String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
-  f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
+  f.close(); updateIntervalH = constrain(updateIntervalH, 1, 168);
 }
 static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
@@ -746,7 +735,7 @@ void setup() {
     buildFlashIndex();
   }
   loadCustom(); loadBanned(); loadUpdateCfg();
-  prefs.begin("ui", true); nightMode = prefs.getUChar("night", 0); nightFrom = prefs.getUChar("from", 22); nightTo = prefs.getUChar("to", 7); nightTz = prefs.getChar("tz", 7); updateDays = prefs.getUChar("ud", 0); updateHour = prefs.getUChar("uh", 3); prefs.end();
+  prefs.begin("ui", true); nightMode = prefs.getUChar("night", 0); nightFrom = prefs.getUChar("from", 22); nightTo = prefs.getUChar("to", 7); clockTz = prefs.getChar("tz", 7); updateDays = prefs.getUChar("ud", 0); updateHour = prefs.getUChar("uh", 3); prefs.end();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
@@ -796,9 +785,9 @@ void setup() {
     if (web.hasArg("m")) nightMode = constrain(web.arg("m").toInt(), 0, 2);
     if (web.hasArg("from")) nightFrom = constrain(web.arg("from").toInt(), 0, 23);
     if (web.hasArg("to")) nightTo = constrain(web.arg("to").toInt(), 0, 23);
-    if (web.hasArg("tz")) nightTz = constrain(web.arg("tz").toInt(), -12, 14);
-    if (web.args()) { prefs.begin("ui", false); prefs.putUChar("night", nightMode); prefs.putUChar("from", nightFrom); prefs.putUChar("to", nightTo); prefs.putChar("tz", nightTz); prefs.end(); }
-    web.send(200, "text/plain", String(nightMode) + " " + nightFrom + "-" + nightTo + " tz" + nightTz + (nightLocalHour(nightTz) < 0 ? " nosync" : ""));
+    setClockTz();
+    if (web.args()) { prefs.begin("ui", false); prefs.putUChar("night", nightMode); prefs.putUChar("from", nightFrom); prefs.putUChar("to", nightTo); prefs.putChar("tz", clockTz); prefs.end(); }
+    web.send(200, "text/plain", String(nightMode) + " " + nightFrom + "-" + nightTo + " tz" + clockTz + (localHour() < 0 ? " nosync" : ""));
   });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
   web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "Wi-Fi cleared, rebooting into setup");
@@ -809,10 +798,11 @@ void setup() {
   web.on("/setupdate", []() {
     if (!requireAuth()) return;
     if (web.hasArg("u")) updateUrl = web.arg("u");
-    if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
+    if (web.hasArg("h")) updateIntervalH = constrain(web.arg("h").toInt(), 1, 168);
+    setClockTz();
     if (web.hasArg("d")) updateDays = constrain(web.arg("d").toInt(), 0, 127);
     if (web.hasArg("hr")) updateHour = constrain(web.arg("hr").toInt(), 0, 23);
-    prefs.begin("ui", false); prefs.putUChar("ud", updateDays); prefs.putUChar("uh", updateHour); prefs.end();
+    prefs.begin("ui", false); prefs.putUChar("ud", updateDays); prefs.putUChar("uh", updateHour); prefs.putChar("tz", clockTz); prefs.end();
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.begin();
@@ -829,13 +819,13 @@ void loop() {
   static uint32_t dnsCheckMs, macCheckMs;
   if (millis() - macCheckMs >= 1000) { macCheckMs = millis(); refreshMacs(); }
   if (millis() - dnsCheckMs >= 60000) { dnsCheckMs = millis(); if (WiFi.isConnected() && WiFi.dnsIP() != UPSTREAM) pinDns(); }
-  uiTick(totalBlocked, totalAllowed, numClients, numHashes, !blockingOn, nightActive(nightMode, nightLocalHour(nightTz), nightFrom, nightTo));
+  uiTick(totalBlocked, totalAllowed, numClients, numHashes, !blockingOn, nightActive(nightMode, localHour(), nightFrom, nightTo));
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
-    int day, hour;
+    int day, dow, hour;
     if (updateDays) {
-      if (localClock(nightTz, day, hour) && updateDue(updateDays, (day + 4) % 7, hour, updateHour, day, lastSchedDay) && now - lastCheckMs >= 600000UL) {
+      if (nowLocal(day, dow, hour) && updateDue(updateDays, dow, hour, updateHour, day, lastSchedDay) && now - lastCheckMs >= 600000UL) {
         lastCheckMs = now;
         if (fetchBlocklist(updateUrl) || numHashes > 0) lastSchedDay = day;
       }
