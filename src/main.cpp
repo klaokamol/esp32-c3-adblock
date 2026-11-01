@@ -537,8 +537,8 @@ static bool commitNewBlocklist() {                  // /blocklist.new -> live (v
   bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
   ok = ok && blobSorted(f);
   if (f) f.close();
-  if (ok) { if (blocklist) blocklist.close(); LittleFS.remove(BLOCKLIST_PATH); LittleFS.rename("/blocklist.new", BLOCKLIST_PATH); }
-  else    LittleFS.remove("/blocklist.new");
+  if (ok) { if (blocklist) blocklist.close(); ok = LittleFS.rename("/blocklist.new", BLOCKLIST_PATH); }
+  if (!ok) LittleFS.remove("/blocklist.new");
   reopenBlocklist();
   return ok;
 }
