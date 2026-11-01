@@ -434,11 +434,7 @@ static String clockStamp() {
 static String gapList() { String g; for (int i = 0; i < GAP_BUCKETS; i++) { g += (i ? "," : ""); g += gapHist[i]; } return g; }
 static void handleStats() {
   uint32_t up = (uint32_t)(esp_timer_get_time() / 1000000);
-  char ut[24];
-  if (up >= 86400) snprintf(ut, sizeof(ut), "%lud %luh", up/86400, (up%86400)/3600);
-  else if (up >= 3600) snprintf(ut, sizeof(ut), "%luh %lum", up/3600, (up%3600)/60);
-  else if (up >= 60) snprintf(ut, sizeof(ut), "%lum", up/60);
-  else snprintf(ut, sizeof(ut), "%lus", up);
+  char ut[8]; fmtUptime(ut, sizeof ut, up);
   int rssi = WiFi.RSSI(); String temp = String(temperatureRead(), 1); uint32_t heap = ESP.getFreeHeap();
   String sys = "Wi-Fi " + String(rssi) + " dBm · chip " + temp + " °C · " + String(heap / 1024) + " KB RAM free · up " + ut;
   sys.replace(" ", "\u00a0"); sys.replace("\u00a0\u00b7\u00a0", " \u00b7 ");
